@@ -1,0 +1,13 @@
+[project]
+name = "vul-mcp-check"
+version = "0.1.0"
+description = "Read-only MCP cloud connectivity probe"
+requires-python = ">=3.12,<3.13"
+dependencies = ["mcp==2.3.0", "uvicorn>=0.38,<1"]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "httpx>=0.28,<1", "pyyaml>=6,<7"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

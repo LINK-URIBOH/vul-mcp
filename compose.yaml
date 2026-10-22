@@ -1,0 +1,25 @@
+services:
+  mcp:
+    build: .
+    image: vul-mcp-check:0.1.0
+    restart: unless-stopped
+    init: true
+    environment:
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://vul.valna.cn}
+    ports:
+      - "127.0.0.1:${HOST_PORT:-8000}:8000"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    mem_limit: 256m
+    cpus: 0.50
+    pids_limit: 100
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
