@@ -1,8 +1,11 @@
 .venv
 .git
 .env
+secrets
+tests
 __pycache__
 .pytest_cache
-tests
+.ruff_cache
 *.zip
+*.png
 uv.lock

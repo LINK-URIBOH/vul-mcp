@@ -1,165 +1,172 @@
-# MCP 云端接入验证版
+# 漏洞情报正式版
 
-只验证 Codex 云端是否能调用服务器，公开地址为 **https://vul.valna.cn/mcp**。
-无身份验证，无数据库，无漏洞采集、报告存储、邮件或 Webhook。整个业务工具列表只有 `health_check`。
+独立于 `vul-mcp-check` 交付。本目录不包含生产密码、令牌、收件地址或 Webhook 目标。
+Codex 云端执行分析；Debian 服务采集、去重、归档与投递。不需要额外模型 API，也不要求个人电脑开机。
 
-## 1. Debian / Docker 部署
+## 组件与内存
 
-将本目录上传到服务器，例如 `/opt/vul-mcp-check`。已有宿主机 Nginx 负责 HTTPS。
+| 服务 | 职责 | 容器内存上限 |
+| --- | --- | --- |
+| web | OAuth MCP、中文管理网页、报告生成 | 256 MB |
+| worker | 串行采集、数据库任务队列、投递重试 | 384 MB |
+| PostgreSQL | 独立业务及 Keycloak 数据库、独立账号 | 256 MB |
+| Keycloak | OAuth/OIDC、PKCE、令牌刷新 | 768 MB，Java 堆384 MB |
+
+上限合计1664 MB，需额外预留宿主机和已有 Nginx 的资源；不能把此数字当作整机占用保证。约2 GB环境应先执行 `RESOURCE_TEST.md`，若出现 OOM，优先把认证或数据库迁移到另一台服务器。没有 Redis，也没有独立前端运行服务。
+
+## 1. 首次配置
+
+默认使用新目录、新 Compose 项目和新端口；先不要替换现有验证版。
 
 ```bash
-cd /opt/vul-mcp-check
+cd /opt/vul-intel
 cp .env.example .env
+chmod 600 .env
+```
+
+编辑 `.env`：
+
+- `PUBLIC_BASE_URL=https://vul.valna.cn`，`ISSUER_URL=https://vul.valna.cn/auth/realms/vul`。
+- `MCP_REDIRECT_URI`：填写自定义 MCP 高级 OAuth 界面实际显示的**准确 HTTPS 回调**，不要使用通配符。
+- 默认应用回环端口8001、认证回环端口8081；若冲突，修改 `HOST_PORT`、`AUTH_PORT` 和 Nginx 上游。
+- 填写 SMTP 与 Webhook 配置；先保持 `DELIVERY_ENABLED=false`。凭据含 `$` 等字符时使用 dotenv 单引号，避免 Compose 插值。
+
+然后用系统 Python 3 生成随机密码和 realm 文件，无需安装项目依赖：
+
+```bash
+python3 scripts/bootstrap.py
 docker compose config --quiet
-docker compose up -d --build
+docker compose build web keycloak
+docker compose up -d --wait
 docker compose ps
-curl --fail http://127.0.0.1:8000/healthz
-docker compose exec -T mcp python scripts/probe.py --marker debian-local-01
+curl --fail http://127.0.0.1:8001/healthz
 ```
 
-最后一个命令会发现工具、读取实时结果、核对标记和时间，并测试错误参数；成功输出 `"probe": "passed"`，失败退出码非零。服务器需校准时间，与检查机器相差超过 120 秒会失败。
+第一次 Keycloak 初始化可能需要几分钟。脚本不会打印密码；在服务器本地安全读取 `.env` 中的 `ADMIN_USERNAME`、`ADMIN_PASSWORD`，不要将文件发到聊天。
+以 root 运行初始化时会把 realm 文件交给 Keycloak 的 UID1000；非 root 部署需执行 `sudo chown 1000:0 secrets/realm.json` 并保持文件600权限。
 
-默认仅发布 `127.0.0.1:8000`，不将应用端口暴露到公网。端口冲突时在 `.env` 调整 `HOST_PORT`，并同步改 Nginx 上游端口；容器内部仍用 8000。
-默认域名已设置，不需要编辑代码。`PUBLIC_BASE_URL` 是 HTTPS **源地址**，不要包含 `/mcp`、查询参数或凭据。
+`bootstrap.py` 拒绝覆盖已有 realm 文件。Keycloak 已有数据库时不会重新导入 realm，因此修改导入 JSON 不是更新线上配置的方式。后续通过受控 Keycloak 管理入口或管理 CLI 修改。
+默认 Keycloak 管理员 `bootstrap-admin` 是初始化账号，请按 Keycloak 的流程建立持久管理账号并移除临时账号；业务网页登录使用单独的 `ADMIN_USERNAME`，两者职责不同。
 
-应用容器以非 root 用户运行、根文件系统只读。标准错误输出包含 JSON 业务日志，Docker 保留最多 3 个 10 MB 日志文件；没有额外挂载业务数据卷。
+业务数据库版本迁移在启动时执行并记录到 `schema_migrations`。首次版本为1；不要在生产数据库手工调用 `create_all` 代替未来的升级迁移。
 
-## 2. Nginx 反代要求（由你配置）
+## 2. Nginx 和 Cloudflare
 
-参考 `nginx.example.conf`，它是需要合并的片段，不能原样覆盖已有证书配置。
+将 `deploy/nginx.example.conf` 的片段合并到现有配置，由你维护证书。不要整份覆盖现有 Nginx 配置。
 
-- `limit_req_zone` 放在 `http {}`，`location = /mcp` 放在现有域名的 HTTPS `server {}`。
-- `proxy_pass http://127.0.0.1:8000;` 不加尾部 `/`，保留路径 `/mcp`。
-- 上游 Host 保持 `vul.valna.cn`。SDK 校验 Host 和存在的 Origin；不要改为 Docker 服务名，也不要删除 Origin 来绕过校验。
-- 使用 HTTP/1.1，禁用代理缓冲和缓存；读写超时 60 秒，连接超时 5 秒。
-- 完整转发 GET、POST、DELETE 及 MCP 请求头。此版本主要使用 POST + JSON 响应；GET 返回 405 在无状态模式下可能是正常行为，不能仅凭浏览器打开 URL 判断成功。
-- 不添加 Basic Auth、浏览器验证码、跳转登录或 HTML 错误拦截；本轮 MCP 为“无需身份验证”。
-- 示例按来源 IP 限流 5 请求/秒、突发 30，拒绝返回 429。云端可能共享出口 IP，遇到限流时根据日志调整阈值。
-- `/healthz` 仅供本机和容器存活检查，不需要公网代理。
+- `/mcp`、`/admin/`、`/static/` 和 `/.well-known/` 指向8001。
+- `/auth/realms/`、`/auth/resources/` 指向8081；认证代理覆盖设置 `X-Forwarded-Proto=https`、Host及端口。
+- Keycloak 管理控制台和健康接口默认不暴露公网。管理操作通过 SSH 端口转发访问回环服务，或使用容器内 `kcadm.sh`。
+- Keycloak管理健康端口9000不发布；服务及数据库不直接发布到公网。
+- 保留 MCP 请求头及 POST/GET/DELETE，关闭 MCP 缓冲、缓存，保持120秒代理读写超时，允许最大1 MiB请求。
+- Cloudflare 对 MCP、认证及发现路径不得返回浏览器挑战页或缓存登录响应。只调整相关 API 路径，不停用整站保护。
 
-Nginx 生效后，从独立网络验证：
+正式上线需要同时切换上述路径，原无认证 `/mcp` 将变为受保护端点。保留原验证版目录作为回归依据，不并行在同一 URL 暴露两套 MCP。
+
+验证：
 
 ```bash
-curl -i https://vul.valna.cn/mcp \
-  -H 'Content-Type: application/json' \
+curl -i https://vul.valna.cn/.well-known/oauth-protected-resource/mcp
+curl -i -X POST https://vul.valna.cn/mcp -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
-  -H 'MCP-Protocol-Version: 2025-06-18' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl-check","version":"1.0"}}}'
+  --data '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-预期 HTTP 200，JSON 中包含 `result.serverInfo.name: "vul-mcp-check"`。
-HTTP 421 检查 Host；403 检查 Origin；404 检查路径改写；502 检查容器端口；429 检查限流；证书错误应修复证书链。
+发现文档应返回200；未认证 MCP 应返回401和 `WWW-Authenticate`，这是正确行为。
+管理网页为 `https://vul.valna.cn/admin/`，登录会话有效30分钟，Cookie为 Secure、HttpOnly、SameSite=Lax。退出管理页只结束该网页会话；Keycloak SSO及已授权连接需在认证服务中单独撤销。
 
-还可从容器经公网域名执行完整检查：
+## 3. 云端连接及自动投递验收
+
+按 `CLOUD_TASK.md` 配置预注册的公共 OAuth 客户端 `vul-mcp`（`none`客户端认证、PKCE S256），明确请求读取、提交和投递权限及离线刷新。
+管理网页使用独立的保密客户端 `vul-web`。服务验证签名、受众、签发者、有效期、管理员角色及工具权限。
+
+先验证人工调用、权限不足拒绝、5分钟后的令牌刷新，再用固定的测试收件目标验证云端定时写入。
+只有确认平台无需人工批准写操作、两个渠道的测试目标正确后，才修改服务器：
+
+```dotenv
+DELIVERY_ENABLED=true
+```
 
 ```bash
-docker compose exec -T mcp python scripts/probe.py \
-  --url https://vul.valna.cn/mcp --marker public-probe-01
+docker compose up -d --force-recreate web worker
 ```
 
-此项能验证域名和代理，但服务器自己访问成功仍不等于 OpenAI 云端已能访问。
+开关关闭时，报告仍能归档并排队，工作进程不发送。启用开关会处理已有待发队列，请先在网页核对历史测试报告和固定目标。
+不要因平台要求批准而把写操作标记成只读。当前交付不替你创建云端任务，不修改线上连接或 Cloudflare 规则。
 
-## 3. 添加到 Codex 云端
+## 4. 采集与报告行为
 
-在“插件 → 添加 → 添加自定义 MCP 服务器”填写：
+预置29个来源，见 `SOURCES.md`。首次请求近7天及近期发现的厂商公告；之后按各源上次成功时间重叠回查48小时。旧 CVE 的新补丁、别名、在野利用和受影响范围变化会重新进入报告。
+按资料进入数据库的更新时间分配09:00/18:00时间段；在时间段结束后才采集到的数据进入下一期。批次保留生成时的事实快照和来源状态，后续公告变化不会悄悄改写已归档报告。
 
-| 字段 | 值 |
-| --- | --- |
-| 名称 | 漏洞情报接入测试 |
-| 描述 | 只读连接测试：返回服务名称、UTC 时间及验证标记 |
-| 连接 | 服务器 URL |
-| URL | `https://vul.valna.cn/mcp` |
-| 身份验证 | 无需身份验证 |
+- 来源独立推进进度。部分记录成功、后续分页失败时，保留已写数据和失败状态，但不推进来源成功时间。
+- CVE/GHSA/OSV别名合并；一篇公告提到多个 CVE 时，不把这些 CVE 错当作同一个漏洞的别名。
+- 来源原文及版本条件完整保留，厂商回补补丁由云端分析按公告解释，不用上游版本号猜测发行版状态。
+- 高危、严重、已利用、未评分条目及已报告记录的重要变化进入分析队列；其余进入完整索引。未评分不等于低危。
+- 未完成批次优先恢复。重点条目未分析完成时禁止 finalize；配额不足时保留进度，不能承诺所有广泛来源必定在一次云端运行中分析完。
+- 报告按时间段唯一，finalize与投递入队在同一数据库事务内。重试finalize不会重复入队。
+- HTML、Markdown、JSON、CSV按报告UUID保存。网页可下载，邮件正文提供分卷分析，CSV索引按大小分卷；Webhook按条数/大小分批。
+- 来源缺失/过期记录在报告和网页中明确标注；无新增也生成简报。
 
-添加后在**云端聊天**选中该工具，手动发送以下指令：
+云端分析包含根因、触发前提、影响版本、攻击路径、修复方式、证据等级与引用。服务校验结构和必填项，无法自动保证模型分析的真实性，重要处置仍需核对原始公告。
+不执行利用代码，不扫描目标，不使用网页来源内容作为指令。
 
-> 调用“漏洞情报接入测试”的 health_check，marker 为 manual-20261022-01。必须实际调用工具，原样返回结构化结果。调用失败就报告失败，不要猜测服务器时间。
+## 5. 双渠道投递
 
-同时在服务器执行：
+SMTP只允许STARTTLS或SSL，凭据不进入网页、MCP或报告。邮件正文和附件分卷，默认每封最大8 MB；单条极大公告超过单封分卷预算时会阻止完成并保留失败原因，调整 `SMTP_MAX_BYTES` 后恢复批次，不丢弃条目。
+
+Webhook必须使用HTTPS，不跟随重定向。目标和签名密钥只能在服务器配置。消息头：
+
+```text
+X-Vul-Message-Id: <稳定的投递UUID>
+X-Vul-Timestamp: <Unix秒>
+X-Vul-Signature: sha256=<HMAC-SHA256>
+```
+
+签名输入是 `timestamp + "." + 原始请求体字节`。接收端先校验签名、时间窗口（建议5分钟）并按消息ID去重，再返回2xx确认。
+JSON字段含 `schema_version=1.0`、`message_id`、`report_id`、`slot`、`part`、`parts`、`summary`、`coverage`、`items`。
+同一消息重试时ID和请求体不变，时间戳与签名重新生成。网络超时可能发生“已收到但确认丢失”，无法保证绝不重复；邮件使用稳定 Message-ID，Webhook仍必须接收端去重。
+
+每个渠道及每个分卷独立保存状态。默认失败退避1、2、4、8分钟，最多5次；超过次数转为失败，网页/CLI可重试。成功渠道不会重发。进程崩溃的发送租约10分钟后恢复。
+任务状态 `pending` 表示排队，不等于已送达；只有 `sent` 表示服务端收到成功确认。邮件 SMTP 接受不代表最终进入收件箱。
+
+## 6. 管理和排障
+
+网页提供工作台、漏洞索引与详情、报告归档、来源启停与补采、任务重试、投递记录。密钥及目标不在网页编辑。所有写操作需要登录与 CSRF，操作留有审计记录。
 
 ```bash
-docker compose logs --since 10m mcp
+docker compose logs --since 30m web worker
+docker compose exec -T web python -m vulintel.cli status
+docker compose exec -T web python -m vulintel.cli collect nvd
+docker compose exec -T web python -m vulintel.cli retry delivery <失败投递ID>
+docker stats --no-stream
 ```
 
-日志中的 `event=health_check`、`outcome=ok`、标记和 UTC 时间应与云端结果匹配。标记只放公开测试字符串，不放个人信息或密钥。
+业务日志不输出JWT、SMTP密码或Webhook密钥。错误详情可能只显示异常类型与HTTP状态；使用来源ID和任务时间核对网络问题。NVD/GitHub限流可配置自己的API密钥；数据源403/404会展示失败，不被视为无漏洞。
+查看404、502、401和403时分别检查路径/上游、容器状态、OAuth登录/令牌、角色和权限；同时核对Cloudflare安全事件。
 
-## 4. 云端定时及关机验证
+## 7. 备份、恢复与升级
 
-手动调用成功后，在同一个云端聊天创建**一次性**任务，安排到足够晚的未来时间（例如 10 分钟后），确认运行位置为**云端**、时区为 **Asia/Shanghai 或 Etc/GMT-8**。
-此项目不会自行创建本地自动化；当前桌面端任务工具不能替代账号内的云端运行位置确认。
-
-指令模板（把日期、时间和唯一标记换成实际值）：
-
-> 请在北京时间 YYYY-MM-DD HH:mm 执行一次，不重复。使用“漏洞情报接入测试”调用 health_check，marker 固定为 cloud-YYYYMMDD-HHmm-01。必须实际调用工具，返回 service_name、service_version、server_time_utc、marker；调用失败请明确报告错误，不得使用示例结果或自行生成服务器时间。
-
-随后关闭个人电脑，服务器保持在线。在计划时间后通过手机或其他设备核对：
-
-1. 云端任务完成，未停在审批或等待输入状态。
-2. 返回标记与本次任务完全相同。
-3. 服务器日志存在相同标记和对应 UTC 时间（北京时间减 8 小时）。
-4. HTTP 日志成功不够，必须有对应的 `health_check` 成功日志。
-
-无身份验证时，任何人都能调用这个公开探针，日志本身不能证明调用方身份；需同时对照云端工具执行记录和本次唯一标记。
-若任务要求批准，说明无人值守调用尚未通过，不能通过将写操作伪装成只读来规避。
-验证后检查一次性任务已完成；如果界面实际建立了重复计划，暂停或删除该测试计划。
-
-## 5. 工具契约与日志
-
-`health_check(marker?: string | null)`：省略或 null 均可；非空标记只接受 1–128 位 ASCII 字母、数字、`.`、`_`、`:`、`-`，原样回传。
-数字、布尔值、空字符串、换行和过长字符串返回 MCP 错误。
-工具注解为只读、非破坏、幂等、无外部访问。每次返回时间不同，幂等指不会改变业务状态。
-
-结果示例（时间仅为格式示意）：
-
-```json
-{
-  "service_name": "vul-mcp-check",
-  "service_version": "0.1.0",
-  "server_time_utc": "2026-10-22T01:00:00.000Z",
-  "marker": "cloud-20261022-0900-01"
-}
+```bash
+bash scripts/backup.sh /secure-backups/vul-YYYYMMDD
+# 恢复会替换数据库，明确确认后执行：
+bash scripts/restore.sh /secure-backups/vul-YYYYMMDD --confirm-replace
 ```
 
-成功日志示意：
+备份脚本暂时停止web、worker和Keycloak，导出两库和报告后恢复服务。数据库dump与报告包含私有分析/审计信息，按敏感备份保管；`.env`和realm导入文件另行加密备份。恢复前先备份当前状态，核对使用相同凭据和数据库版本，恢复后再验证OAuth与投递。
+不要对生产执行 `docker compose down -v`，这会删除数据卷。
 
-```json
-{"timestamp_utc":"2026-10-22T01:00:00.000Z","event":"health_check","outcome":"ok","result":{"service_name":"vul-mcp-check","service_version":"0.1.0","server_time_utc":"2026-10-22T01:00:00.000Z","marker":"cloud-20261022-0900-01"}}
-```
+更新代码前备份、查看迁移说明，再构建并重启。依赖锁定在 `uv.lock` 与带hash的 `requirements.lock`；镜像引用及实测版本见 `VALIDATION.md`。
 
-另有 `http_request` 完成日志，记录请求时间、方法、状态和耗时，不记录请求头、IP 或整个请求体。非法参数可能在 SDK 中被拒绝，没有 `health_check` 成功日志是预期行为。
-不要依赖日志永久保存；Docker 轮转会清除旧记录。
-
-## 6. 开发、锁定与测试
-
-需要 Python 3.12 和 uv。运行依赖完整版本及散列在 `requirements.lock`，开发环境及跨平台依赖在 `uv.lock`。
+## 8. 开发与测试
 
 ```bash
 uv sync --frozen
 uv run --frozen pytest -q
-uv run --frozen python server.py
+uv run --frozen ruff check vulintel scripts tests
+uv run --frozen python -m scripts.check_sources
 ```
 
-另开终端：
+上游抽样只验证当前网络中的一条记录或空窗口，不证明全量完整性。真实收件箱、你的Webhook、OpenAI账号OAuth续期与无人值守写入、线上Nginx和2 GB物理服务器长期运行，均需部署后验收，见 `VALIDATION.md` 和 `RESOURCE_TEST.md`。
 
-```bash
-uv run --frozen python scripts/probe.py --marker local-sdk-01
-```
-
-开发启动会监听 0.0.0.0:8000；仅在可信本机环境使用。生产通过 Compose 将宿主机端口限制在 loopback。
-测试包括旧协议初始化、工具列表与只读注解、标记回传、UTC 时间、日志、非法参数、Host/Origin、请求体限制和配置校验。SDK 客户端检查脚本同时验证当前 SDK 的自动协议协商。
-
-依赖升级时重新锁定并运行测试，再导出生产锁文件：
-
-```bash
-uv lock --upgrade
-uv sync --frozen
-uv run --frozen pytest -q
-uv export --frozen --no-dev --no-emit-project --format requirements-txt --output-file requirements.lock
-```
-
-官方 SDK 参考：[运行服务](https://py.sdk.modelcontextprotocol.io/run/)、[工具定义](https://py.sdk.modelcontextprotocol.io/servers/tools/)。
-
-## 7. 完成边界
-
-本地协议测试通过不等于已在你的服务器部署，也不等于已完成云端定时关机验证。实际验收结果见 `VALIDATION.md`。
-本轮通过后再设计 OAuth、令牌续期和无人值守写入；只有这些也验证通过，才加入漏洞采集、存储、邮件和 Webhook。
+参考：[OpenAI MCP认证](https://developers.openai.com/plugins/build/auth)、[Keycloak生产数据库](https://www.keycloak.org/server/db)、[OSV增量数据](https://google.github.io/osv.dev/data/)。

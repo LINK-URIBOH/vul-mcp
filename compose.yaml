@@ -1,25 +1,104 @@
+name: vul-intel
+x-app: &app
+  image: vul-intel:1.0.0
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql+psycopg://vul:${VUL_DB_PASSWORD:?run bootstrap}@db/vul
+    KEYCLOAK_INTERNAL_URL: http://keycloak:8080/auth/realms/vul
+    DATA_DIR: /data
+  restart: unless-stopped
+  init: true
+  user: "10001:10001"
+  read_only: true
+  tmpfs: ["/tmp:size=32m,mode=1777"]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  volumes: [reports:/data]
+  depends_on:
+    db: {condition: service_healthy}
+    keycloak: {condition: service_healthy}
+  pids_limit: 100
+  logging: &logging
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+
 services:
-  mcp:
-    build: .
-    image: vul-mcp-check:0.1.0
+  db:
+    image: postgres:18@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6
     restart: unless-stopped
-    init: true
     environment:
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://vul.valna.cn}
-    ports:
-      - "127.0.0.1:${HOST_PORT:-8000}:8000"
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    tmpfs:
-      - /tmp:size=16m,mode=1777
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run bootstrap}
+      VUL_DB_PASSWORD: ${VUL_DB_PASSWORD:?run bootstrap}
+      KEYCLOAK_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?run bootstrap}
+    volumes:
+      - postgres:/var/lib/postgresql
+      - ./deploy/init-db.sh:/docker-entrypoint-initdb.d/10-vul.sh:ro
+    command: [postgres, -c, shared_buffers=32MB, -c, work_mem=2MB, -c, maintenance_work_mem=32MB,
+              -c, max_connections=25, -c, max_wal_size=256MB]
     mem_limit: 256m
-    cpus: 0.50
-    pids_limit: 100
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    cpus: 0.5
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    logging: *logging
+  keycloak:
+    build: {context: ., dockerfile: Dockerfile.keycloak}
+    image: vul-keycloak:26.8.1
+    restart: unless-stopped
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://db/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD}
+      KC_DB_POOL_INITIAL_SIZE: "1"
+      KC_DB_POOL_MIN_SIZE: "1"
+      KC_DB_POOL_MAX_SIZE: "5"
+      KC_HOSTNAME: ${PUBLIC_BASE_URL:-https://vul.valna.cn}/auth
+      KC_HTTP_ENABLED: "true"
+      KC_HTTP_RELATIVE_PATH: /auth
+      KC_PROXY_HEADERS: xforwarded
+      KC_BOOTSTRAP_ADMIN_USERNAME: bootstrap-admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_BOOTSTRAP_PASSWORD:?run bootstrap}
+      JAVA_OPTS_KC_HEAP: -Xms128m -Xmx384m
+    command: [start, --optimized, --import-realm]
+    ports: ["127.0.0.1:${AUTH_PORT:-8081}:8080"]
+    volumes: ["./secrets/realm.json:/opt/keycloak/data/import/vul-realm.json:ro"]
+    depends_on:
+      db: {condition: service_healthy}
+    mem_limit: 768m
+    cpus: 0.75
+    healthcheck:
+      test: [CMD, bash, -c, "exec 3<>/dev/tcp/127.0.0.1/9000; printf 'GET /auth/health/ready HTTP/1.0\r\n\r\n' >&3; grep -q '200' <&3"]
+      interval: 15s
+      timeout: 5s
+      start_period: 120s
+      retries: 12
+    logging: *logging
+  web:
+    <<: *app
+    build: .
+    ports: ["127.0.0.1:${HOST_PORT:-8001}:8000"]
+    mem_limit: 256m
+    cpus: 0.5
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+  worker:
+    <<: *app
+    command: [python, -m, vulintel.worker]
+    mem_limit: 384m
+    cpus: 0.5
+    healthcheck:
+      test: [CMD, python, -c, "import pathlib,time; p=pathlib.Path('/data/worker.heartbeat'); assert p.exists() and time.time()-p.stat().st_mtime < 600"]
+      interval: 60s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+volumes:
+  postgres:
+  reports:

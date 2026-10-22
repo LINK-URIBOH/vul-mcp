@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }} · 漏洞情报</title><link rel="stylesheet" href="/static/admin.css"></head>
+<body><a class="skip" href="#main">跳到正文</a><aside><a class="brand" href="/admin/">漏洞情报<span>采集 · 核实 · 处置</span></a>
+<nav aria-label="主导航">{% for url,label in [('/admin/','工作台'),('/admin/vulnerabilities','漏洞索引'),('/admin/reports','报告归档'),('/admin/sources','采集来源'),('/admin/tasks','任务记录'),('/admin/deliveries','投递记录')] %}
+<a href="{{ url }}" {% if path == url %}aria-current="page"{% endif %}>{{ label }}</a>{% endfor %}</nav>
+<div class="aside-note">公开信息需结合你的产品版本核实。<br>时间筛选与记录使用 UTC；报告时间段使用北京时间。</div>
+<form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="logout">退出管理页</button></form></aside>
+<main id="main"><header><p class="section-name">漏洞情报管理</p><h1>{{ title }}</h1><p>重点查看已利用漏洞、待完成报告和失败任务。</p></header>
+{% if stats %}<dl class="stats">{% for key,value in stats.items() %}<div><dt>{{ key }}</dt><dd>{{ value }}</dd></div>{% endfor %}</dl>{% endif %}
+{% if delivery_enabled is defined and not delivery_enabled %}<p class="warning" role="status">自动投递尚未启用。请先完成 OAuth 与云端写入验证，再由服务器配置启用邮件和 Webhook。</p>{% endif %}
+{% if coverage %}{% set failed = [] %}{% for source in coverage %}{% if source.enabled and (source.error or source.stale) %}{% set _ = failed.append(source) %}{% endif %}{% endfor %}
+{% if failed %}<section class="warning"><h2>采集不完整</h2><p>{% for source in failed %}{{ source.name }}：{{ source.error or '尚未采集或数据过期' }}{% if not loop.last %}；{% endif %}{% endfor %}</p></section>{% endif %}{% endif %}
+{% if filters is defined %}<form class="filters" method="get"><label>编号或标题<input name="q" value="{{ filters.get('q','') }}" placeholder="例如 CVE 编号"></label>
+<label>产品<input name="product" value="{{ filters.get('product','') }}" placeholder="产品或依赖名称"></label>
+<label>严重性<select name="severity"><option value="">全部</option>{% for key,label in [('critical','严重'),('high','高危'),('medium','中危'),('low','低危'),('unknown','未评分')] %}<option value="{{ key }}" {% if filters.get('severity') == key %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+<label>已利用<select name="exploited"><option value="">全部</option><option value="yes" {% if filters.get('exploited') == 'yes' %}selected{% endif %}>是</option><option value="no" {% if filters.get('exploited') == 'no' %}selected{% endif %}>未确认</option></select></label>
+<label>开始日期<input type="date" name="since" value="{{ filters.get('since','') }}"></label><label>结束日期<input type="date" name="until" value="{{ filters.get('until','') }}"></label><button>筛选记录</button></form>{% endif %}
+{% if summary %}<section class="summary"><h2>摘要</h2><p>{{ summary }}</p></section>{% endif %}
+{% if downloads %}<div class="downloads">{% for file in downloads %}<a href="{{ file.url }}">下载 {{ file.label }}</a>{% endfor %}</div>{% endif %}
+{% if detail %}<section class="detail"><pre>{{ detail }}</pre></section>{% endif %}
+{% if vulnerability %}<section class="summary"><p>{{ vulnerability.aliases|join(', ') }} · {{ vulnerability.severity|statuslabel }} · 已利用：{{ '是' if vulnerability.exploited else '未确认' }}</p><h2>漏洞说明</h2><p>{{ vulnerability.description }}</p>
+{% for label,value in narrative %}<h2>{{ label }}</h2><p>{{ value }}</p>{% endfor %}<h2>参考资料</h2><ul>{% for ref in vulnerability.references %}<li>{{ ref }}</li>{% endfor %}</ul>
+<details><summary>查看来源事实和版本条件</summary><pre>{{ raw_detail }}</pre></details></section>{% endif %}
+{% if columns %}<div class="table-wrap"><table><thead><tr>{% for column in columns %}<th scope="col">{{ column }}</th>{% endfor %}<th scope="col">操作</th></tr></thead>
+<tbody>{% for row in rows %}<tr>{% for value in row.cells %}<td {% if value in ['critical','high','failed'] %}class="risk"{% endif %}>{{ value|statuslabel }}</td>{% endfor %}<td class="actions">{% if row.link %}<a href="{{ row.link }}">查看详情</a>{% endif %}
+{% for action in row.actions or [] %}<form method="post" action="{{ action.url }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button>{{ action.label }}</button></form>{% endfor %}</td></tr>
+{% else %}<tr><td colspan="{{ columns|length + 1 }}" class="empty">暂无记录。请检查采集来源是否启用及最近运行状态。</td></tr>{% endfor %}</tbody></table></div>{% endif %}
+{% if next_url %}<a class="next" href="{{ next_url }}">下一页</a>{% endif %}
+{% if events %}<section><h2>最近操作</h2><ul class="events">{% for event in events %}<li><time>{{ event.at }}</time> {{ event.action }} <span>{{ event.target }}</span></li>{% endfor %}</ul></section>{% endif %}
+<footer>上游公告和分析推测分别核实。未确认利用，不代表不存在风险。</footer></main></body></html>
