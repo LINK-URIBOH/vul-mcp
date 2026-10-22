@@ -238,8 +238,9 @@ async def sources(request):
         if not identity:
             return RedirectResponse("/admin/login", status_code=303)
         values = list(db.scalars(select(Source).order_by(Source.id)))
-        return page(request, identity, "采集来源", columns=["来源", "状态", "最后成功（UTC）", "错误"],
-                    rows=[{"cells": [s.name, "启用" if s.enabled else "停用", s.last_success or "尚未采集", s.error or "—"],
+        return page(request, identity, "采集来源", columns=["来源", "状态", "最后成功（UTC）", "下次采集/重试（UTC）", "错误"],
+                    rows=[{"cells": [s.name, "启用" if s.enabled else "停用", s.last_success or "尚未采集",
+                                      s.next_run if s.enabled else "—", s.error or "—"],
                            "actions": [{"label": "停用" if s.enabled else "启用", "url": f"/admin/actions/source/{s.id}/toggle"},
                                        {"label": "补采", "url": f"/admin/actions/source/{s.id}/collect"}]} for s in values])
 

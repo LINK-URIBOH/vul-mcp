@@ -147,6 +147,8 @@ docker stats --no-stream
 
 ## 7. 备份、恢复与升级
 
+v1.0.1 的构建、备份、完整来源验收及回退步骤见 [UPGRADE_v1.0.1.md](UPGRADE_v1.0.1.md)。该版本修复采集响应重复解压、微软大文档读取和 OSV 索引连接问题；新增依赖 `ijson` 已按精确版本和 hash 锁定。
+
 ```bash
 bash scripts/backup.sh /secure-backups/vul-YYYYMMDD
 # 恢复会替换数据库，明确确认后执行：

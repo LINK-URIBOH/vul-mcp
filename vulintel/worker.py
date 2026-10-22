@@ -7,6 +7,7 @@ from sqlalchemy import delete, select, text
 
 from .app import initialize
 from .config import settings
+from .collector import error_details, log_event
 from .db import Job, LoginFlow, Source, WebSession, build_engine, now, session
 from .delivery import deliver_one
 from .sources import collect_one
@@ -15,9 +16,15 @@ log = logging.getLogger("vulintel.worker")
 stopping = False
 
 
-def tick_delivery():
+def touch_heartbeat():
+    if stopping:
+        raise InterruptedError("Worker stopping")
     settings().data_dir.mkdir(parents=True, exist_ok=True)
     (settings().data_dir / "worker.heartbeat").touch()
+
+
+def tick_delivery():
+    touch_heartbeat()
     with session() as db:
         deliver_one(db)
 
@@ -42,13 +49,17 @@ def work_once():
         job_id, source_id = job.id, job.source_id
         db.commit()
     try:
-        collect_one(source_id, force=True, heartbeat=tick_delivery)
+        collect_one(source_id, force=True, heartbeat=touch_heartbeat, delivery_tick=tick_delivery, job_id=job_id)
         status, error = "done", None
     except Exception as exc:
-        status, error = "failed", type(exc).__name__ + " · 采集失败，查看来源状态"
-        log.warning("collection_failed source=%s type=%s", source_id, type(exc).__name__)
+        details = error_details(exc)
+        status, error = "failed", details["reason"]
+        log_event("job_failed", level=logging.WARNING, source=source_id, job=job_id, **details)
     with session() as db:
         job = db.get(Job, job_id)
+        source = db.get(Source, source_id)
+        if status == "failed" and source and source.error:
+            error = source.error
         job.status, job.error, job.lease_until = status, error, None
         db.commit()
     return True
@@ -90,7 +101,7 @@ def main():
                 if not busy:
                     time.sleep(5)
             except Exception as exc:
-                log.error("worker_iteration_failed type=%s", type(exc).__name__)
+                log_event("worker_iteration_failed", level=logging.ERROR, **error_details(exc))
                 time.sleep(10)
     finally:
         lock.close()

@@ -31,7 +31,7 @@ def test_nvd_pagination():
     upstream.close()
 
 
-def test_osv_stream_window_and_record():
+def test_osv_stream_window_and_record(store):
     def response(request):
         if str(request.url).endswith("modified_id.csv"):
             return httpx.Response(200, text="2026-10-21T00:00:00Z,GO-2026-1234\n2020-01-01T00:00:00Z,GO-2020-1\n")
