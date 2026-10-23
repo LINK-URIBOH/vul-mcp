@@ -17,6 +17,14 @@ from .reports import email_body_parts, export_item, items_for, split_csv
 
 
 def prepare_deliveries(db, batch, unused_items, artifacts):
+    channels = settings().delivery_channels
+    if "webhook" in channels:
+        prepare_webhook(db, batch)
+    if "email" in channels:
+        prepare_email(db, batch, artifacts)
+
+
+def prepare_webhook(db, batch):
     cfg = settings()
     # Store small, stable batches. No network I/O occurs inside report finalization.
     part_ids, chunk, size = [], [], 0
@@ -44,6 +52,10 @@ def prepare_deliveries(db, batch, unused_items, artifacts):
         row = db.get(Delivery, did)
         row.payload = {**row.payload, "parts": len(part_ids)}
         db.flush()
+
+
+def prepare_email(db, batch, artifacts):
+    cfg = settings()
     attachments = split_csv(Path(artifacts["csv"]), cfg.smtp_max_bytes)
     bodies = email_body_parts(batch, db, cfg.smtp_max_bytes)
     part_count = max(len(attachments), len(bodies))
@@ -133,11 +145,13 @@ def deliver_one(db, sender=None):
     if not cfg.delivery_enabled:
         return False
     # Reclaim expired leases. Stable message IDs protect receivers from crash/retry duplicates.
-    expired = list(db.scalars(select(Delivery).where(Delivery.status == "sending", Delivery.lease_until < now())))
+    expired = list(db.scalars(select(Delivery).where(Delivery.status == "sending", Delivery.lease_until < now(),
+                                                   Delivery.channel.in_(cfg.delivery_channels))))
     for row in expired:
         row.status = "failed" if row.attempts >= cfg.delivery_max_attempts else "pending"
     db.commit()
-    row = db.scalar(select(Delivery).where(Delivery.status == "pending", Delivery.next_run <= now())
+    row = db.scalar(select(Delivery).where(Delivery.status == "pending", Delivery.next_run <= now(),
+                                         Delivery.channel.in_(cfg.delivery_channels))
                     .order_by(Delivery.next_run, Delivery.id).with_for_update(skip_locked=True).limit(1))
     if row is None:
         return False

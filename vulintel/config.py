@@ -47,12 +47,28 @@ class Settings(BaseSettings):
         if self.webhook_batch_size < 1 or self.webhook_batch_size > 100:
             raise ValueError("WEBHOOK_BATCH_SIZE must be 1..100")
         if self.delivery_enabled:
-            if not all([self.smtp_host, self.smtp_from, self.smtp_to,
-                        self.webhook_url, self.webhook_secret.get_secret_value()]):
-                raise ValueError("Both SMTP and Webhook configuration are required before enabling delivery")
+            smtp_present = any([self.smtp_host.strip(), self.smtp_from.strip(), self.smtp_to.strip(),
+                                self.smtp_user.strip(), self.smtp_password.get_secret_value()])
+            webhook_present = bool(self.webhook_url.strip() or self.webhook_secret.get_secret_value())
+            if smtp_present and "email" not in self.delivery_channels:
+                raise ValueError("SMTP 配置不完整：需要 SMTP_HOST、SMTP_FROM、SMTP_TO；账号和密码须同时填写或同时留空")
+            if webhook_present and "webhook" not in self.delivery_channels:
+                raise ValueError("Webhook 配置不完整：需要 WEBHOOK_URL 和 WEBHOOK_SECRET")
+            if not self.delivery_channels:
+                raise ValueError("开启投递至少需要完整配置 SMTP 或 Webhook 中的一个渠道")
         if self.webhook_url and urlsplit(self.webhook_url).scheme != "https":
             raise ValueError("WEBHOOK_URL must use HTTPS")
         return self
+
+    @property
+    def delivery_channels(self):
+        channels = []
+        credentials_paired = bool(self.smtp_user.strip()) == bool(self.smtp_password.get_secret_value())
+        if all([self.smtp_host.strip(), self.smtp_from.strip(), self.smtp_to.strip()]) and credentials_paired:
+            channels.append("email")
+        if self.webhook_url.strip() and self.webhook_secret.get_secret_value():
+            channels.append("webhook")
+        return tuple(channels)
 
     @property
     def resource_url(self):

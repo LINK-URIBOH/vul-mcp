@@ -82,6 +82,11 @@ def test_authenticated_mcp_tools_and_metadata(store, key):
             "params": {"name": "health_check", "arguments": {"marker": "auth-test-01"}}}, headers=auth)
         assert response.json()["result"].get("structuredContent", {}).get("marker") == "auth-test-01", response.text
         readonly = {"Authorization": "Bearer " + token(key, scope="vul.read")}
+        response = client.post("/mcp", json={"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "get_delivery_status", "arguments": {"batch_id": "unknown"}}}, headers=readonly)
+        status = response.json()["result"]["structuredContent"]
+        assert status["configured_channels"] == ["email", "webhook"]
+        assert status["delivery_enabled"] is False and status["deliveries"] == []
         response = client.post("/mcp", json={"jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": {"name": "open_report_batch", "arguments": {}}}, headers=readonly)
         body = response.json()
@@ -105,6 +110,9 @@ def test_web_login_guard_csrf_and_toggle(store):
             assert result.status_code == 200, result.text
             assert "Content-Security-Policy" in result.headers
         path = "/admin/actions/source/nvd/toggle"
+        delivery_page = client.get("/admin/deliveries").text
+        assert "已配置渠道：邮件、Webhook" in delivery_page
+        assert "历史任务保留并暂停" in delivery_page
         assert client.post(path, data={"csrf": "wrong"}).status_code == 403
         assert client.post(path, data={"csrf": "correct"}).status_code == 303
         with store() as db:

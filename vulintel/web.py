@@ -268,6 +268,7 @@ async def deliveries(request):
         offset = offset_page(request)
         records = list(db.scalars(select(Delivery).order_by(Delivery.next_run.desc()).offset(offset).limit(101)))
         return page(request, identity, "投递记录", delivery_enabled=settings().delivery_enabled,
+                    configured_channels=[STATUS_LABELS.get(c, c) for c in settings().delivery_channels],
                     columns=["报告", "渠道", "分卷", "状态", "次数", "错误"],
                     rows=[{"cells": [d.batch_id, d.channel, d.part, d.status, d.attempts, d.error or "—"],
                            "actions": [{"label": "重试失败渠道", "url": f"/admin/actions/delivery/{d.id}/retry"}]

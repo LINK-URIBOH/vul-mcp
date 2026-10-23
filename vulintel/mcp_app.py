@@ -87,7 +87,7 @@ def make_mcp(verifier=None):
 
     @server.tool(annotations=SEND, structured_output=True)
     async def finalize_report(batch_id: str, summary: Annotated[str, Field(min_length=1, max_length=12000)]) -> dict[str, Any]:
-        """Finalize once and queue email + Webhook to fixed configured destinations. This is a write action."""
+        """Finalize once and queue only configured channels to fixed destinations. This is a write action."""
         actor = principal("vul.deliver")
         try:
             return await transaction(finalize, actor, batch_id, summary)
@@ -99,7 +99,9 @@ def make_mcp(verifier=None):
     async def get_delivery_status(batch_id: str) -> dict[str, Any]:
         """Read per-channel, per-part delivery results without triggering a resend."""
         principal("vul.read")
-        return {"deliveries": await transaction(delivery_status, batch_id)}
+        cfg = settings()
+        return {"deliveries": await transaction(delivery_status, batch_id),
+                "configured_channels": list(cfg.delivery_channels), "delivery_enabled": cfg.delivery_enabled}
 
     hostname = cfg.public_base_url.split("//")[1]
     app = server.streamable_http_app(

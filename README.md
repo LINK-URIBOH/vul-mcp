@@ -1,6 +1,6 @@
 # 漏洞情报正式版
 
-当前版本 **v1.0.2**：仅对 CISA 公告设置请求级兼容 User-Agent，修复已复现的 HTTP 403。已有 v1.0.1 部署见 [升级与验收说明](UPGRADE_v1.0.2.md)，本次验证结果见 [验证记录](VALIDATION_v1.0.2.md)。
+当前版本 **v1.0.3**：支持仅 SMTP、仅 HTTPS Webhook 或同时配置两渠道；未配置渠道的历史任务暂停。升级和配置见 [升级说明](UPGRADE_v1.0.3.md)。保留 CISA 请求兼容修复及其 [验证记录](VALIDATION_v1.0.2.md)。
 
 独立于 `vul-mcp-check` 交付。本目录不包含生产密码、令牌、收件地址或 Webhook 目标。
 Codex 云端执行分析；Debian 服务采集、去重、归档与投递。不需要额外模型 API，也不要求个人电脑开机。
@@ -31,7 +31,7 @@ chmod 600 .env
 - `PUBLIC_BASE_URL=https://vul.valna.cn`，`ISSUER_URL=https://vul.valna.cn/auth/realms/vul`。
 - `MCP_REDIRECT_URI`：填写自定义 MCP 高级 OAuth 界面实际显示的**准确 HTTPS 回调**，不要使用通配符。
 - 默认应用回环端口8001、认证回环端口8081；若冲突，修改 `HOST_PORT`、`AUTH_PORT` 和 Nginx 上游。
-- 填写 SMTP 与 Webhook 配置；先保持 `DELIVERY_ENABLED=false`。凭据含 `$` 等字符时使用 dotenv 单引号，避免 Compose 插值。
+- 按需完整填写 SMTP 或 Webhook，或同时配置两者；先保持 `DELIVERY_ENABLED=false`。凭据含 `$` 等字符时使用 dotenv 单引号，避免 Compose 插值。
 
 然后用系统 Python 3 生成随机密码和 realm 文件，无需安装项目依赖：
 
@@ -113,7 +113,11 @@ docker compose up -d --force-recreate web worker
 云端分析包含根因、触发前提、影响版本、攻击路径、修复方式、证据等级与引用。服务校验结构和必填项，无法自动保证模型分析的真实性，重要处置仍需核对原始公告。
 不执行利用代码，不扫描目标，不使用网页来源内容作为指令。
 
-## 5. 双渠道投递
+## 5. 邮件与 Webhook 投递
+
+`DELIVERY_ENABLED` 是总开关。开启时至少配置一个完整渠道；SMTP 的 `SMTP_HOST`、`SMTP_FROM`、`SMTP_TO` 必填，`SMTP_USER` 和 `SMTP_PASSWORD` 同时填写（受信任免认证中继可同时留空）。Webhook 的 `WEBHOOK_URL`、`WEBHOOK_SECRET` 必须同时填写。某渠道未使用时清空其目标及凭据；SMTP 端口、TLS 模式、大小上限和 Webhook 分批条数可保留默认值。开启时仅填部分字段会明确报错，不静默忽略。
+
+报告只为生成时完整配置的渠道创建队列，总开关关闭时仍可归档和排队；两渠道均未配置且总开关关闭时仅归档。重新配置渠道不为已完成报告自动补建任务。未配置渠道的历史队列保留并暂停，不增加尝试次数、不阻塞其他渠道；重新完整配置后，原待处理任务会恢复。已失败任务仍需人工重试，成功任务不会重发。管理页显示已配置渠道，MCP `get_delivery_status` 同时返回 `configured_channels` 和 `delivery_enabled`。
 
 SMTP只允许STARTTLS或SSL，凭据不进入网页、MCP或报告。邮件正文和附件分卷，默认每封最大8 MB；单条极大公告超过单封分卷预算时会阻止完成并保留失败原因，调整 `SMTP_MAX_BYTES` 后恢复批次，不丢弃条目。
 

@@ -8,7 +8,8 @@
 <form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="logout">退出管理页</button></form></aside>
 <main id="main"><header><p class="section-name">漏洞情报管理</p><h1>{{ title }}</h1><p>重点查看已利用漏洞、待完成报告和失败任务。</p></header>
 {% if stats %}<dl class="stats">{% for key,value in stats.items() %}<div><dt>{{ key }}</dt><dd>{{ value }}</dd></div>{% endfor %}</dl>{% endif %}
-{% if delivery_enabled is defined and not delivery_enabled %}<p class="warning" role="status">自动投递尚未启用。请先完成 OAuth 与云端写入验证，再由服务器配置启用邮件和 Webhook。</p>{% endif %}
+{% if delivery_enabled is defined and not delivery_enabled %}<p class="warning" role="status">自动投递尚未启用。完成 OAuth 与云端写入验证后，可配置邮件或 Webhook 中的一个或两个渠道，再开启投递总开关。</p>{% endif %}
+{% if configured_channels is defined %}<p role="status">已配置渠道：{{ configured_channels|join('、') if configured_channels else '无，仅归档报告' }}。未配置渠道的历史任务保留并暂停，不消耗重试次数。</p>{% endif %}
 {% if coverage %}{% set failed = [] %}{% for source in coverage %}{% if source.enabled and (source.error or source.stale) %}{% set _ = failed.append(source) %}{% endif %}{% endfor %}
 {% if failed %}<section class="warning"><h2>采集不完整</h2><p>{% for source in failed %}{{ source.name }}：{{ source.error or '尚未采集或数据过期' }}{% if not loop.last %}；{% endif %}{% endfor %}</p></section>{% endif %}{% endif %}
 {% if filters is defined %}<form class="filters" method="get"><label>编号或标题<input name="q" value="{{ filters.get('q','') }}" placeholder="例如 CVE 编号"></label>
