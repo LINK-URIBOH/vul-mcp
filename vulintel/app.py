@@ -28,6 +28,8 @@ def initialize():
 
 
 def create_app():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    logging.getLogger("vulintel").setLevel(logging.INFO)
     for name in ("httpx", "httpx2", "httpcore", "httpcore2"):
         logging.getLogger(name).setLevel(logging.WARNING)
     cfg = settings()

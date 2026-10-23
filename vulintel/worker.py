@@ -8,7 +8,7 @@ from sqlalchemy import delete, select, text
 from .app import initialize
 from .config import settings
 from .collector import error_details, log_event
-from .db import Job, LoginFlow, Source, WebSession, build_engine, now, session
+from .db import Job, LoginFlow, MetadataState, Source, WebSession, build_engine, now, session
 from .delivery import deliver_one
 from .sources import collect_one
 
@@ -25,16 +25,19 @@ def touch_heartbeat():
 
 def tick_delivery():
     touch_heartbeat()
+    from .report_jobs import run_report_once
+    report_busy = run_report_once()
     with session() as db:
         deliver_one(db)
+    return report_busy
 
 
 def work_once():
     with session() as db:
-        for stale in db.scalars(select(Job).where(Job.status == "running", Job.lease_until < now())):
+        for stale in db.scalars(select(Job).where(Job.kind == "collect", Job.status == "running", Job.lease_until < now())):
             stale.status, stale.error = "failed", "工作进程中断或租约过期，请重试"
         db.commit()
-        job = db.scalar(select(Job).where(Job.status == "pending").order_by(Job.created_at)
+        job = db.scalar(select(Job).where(Job.kind == "collect", Job.status == "pending").order_by(Job.created_at)
                         .with_for_update(skip_locked=True).limit(1))
         if job is None:
             source = db.scalar(select(Source).where(Source.enabled.is_(True), Source.next_run <= now())
@@ -82,13 +85,19 @@ def main():
         lock.commit()
     with session() as db:
         for interrupted in db.scalars(select(Job).where(Job.status == "running")):
-            interrupted.status, interrupted.error = "failed", "上次工作进程中断，请重试"
+            interrupted.status = "pending" if interrupted.kind == "report" else "failed"
+            interrupted.lease_until = None
+            interrupted.error = None if interrupted.kind == "report" else "上次工作进程中断，请重试"
+            if interrupted.kind == "collect":
+                progress = db.get(MetadataState, "source-progress:" + interrupted.source_id)
+                if progress:
+                    progress.value = {**progress.value, "status": "interrupted", "failed_at": now().isoformat() + "Z"}
         db.commit()
     last_cleanup = 0.0
     try:
         while not stopping:
             try:
-                tick_delivery()
+                report_busy = tick_delivery()
                 busy = work_once()
                 if time.monotonic() - last_cleanup > 3600:
                     with session() as db:
@@ -98,7 +107,7 @@ def main():
                     last_cleanup = time.monotonic()
                 settings().data_dir.mkdir(parents=True, exist_ok=True)
                 (settings().data_dir / "worker.heartbeat").touch()
-                if not busy:
+                if not busy and not report_busy:
                     time.sleep(5)
             except Exception as exc:
                 log_event("worker_iteration_failed", level=logging.ERROR, **error_details(exc))

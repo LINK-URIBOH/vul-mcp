@@ -74,7 +74,7 @@ def test_authenticated_mcp_tools_and_metadata(store, key):
         response = client.post("/mcp", json=payload, headers=auth)
         assert response.status_code == 200, response.text
         tools = {t["name"]: t for t in response.json()["result"]["tools"]}
-        assert len(tools) == 7
+        assert len(tools) == 9
         assert tools["health_check"]["annotations"]["readOnlyHint"]
         assert tools["finalize_report"]["annotations"]["readOnlyHint"] is False
         assert tools["finalize_report"]["annotations"]["openWorldHint"] is True
@@ -140,3 +140,22 @@ def test_web_escape_filters_and_expired_session(store):
             db.get(WebSession, token_hash(raw)).expires = now() - timedelta(seconds=1)
             db.commit()
         assert client.get("/admin/").status_code == 303
+
+
+def test_full_report_view_requires_login_and_has_safe_inline_style_policy(store):
+    from report_helpers import finalize, open_batch
+    with store() as db:
+        bid = open_batch(db, "test")["batch_id"]
+        finalize(db, "test", bid, "执行过程不可进入正文")
+        raw = secrets.token_urlsafe(32)
+        db.add(WebSession(id=token_hash(raw), subject="test", csrf="correct", expires=now() + timedelta(minutes=1)))
+        db.commit()
+    with TestClient(create_app(), base_url="https://vul.valna.cn", follow_redirects=False) as client:
+        assert client.get(f"/admin/reports/{bid}/view").status_code == 303
+        client.cookies.set("vul_session", raw)
+        response = client.get(f"/admin/reports/{bid}/view")
+        assert response.status_code == 200 and "text/html" in response.headers["content-type"]
+        assert "default-src 'none'" in response.headers["Content-Security-Policy"]
+        assert "执行过程不可进入正文" not in response.text
+        assert "本批次未取得符合条件的记录" in response.text
+        assert client.get(f"/admin/reports/{bid}/download/unverified").status_code == 200

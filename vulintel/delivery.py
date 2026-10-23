@@ -12,60 +12,7 @@ import httpx
 from sqlalchemy import select
 
 from .config import settings
-from .db import Delivery, now, uid
-from .reports import email_body_parts, export_item, items_for, split_csv
-
-
-def prepare_deliveries(db, batch, unused_items, artifacts):
-    channels = settings().delivery_channels
-    if "webhook" in channels:
-        prepare_webhook(db, batch)
-    if "email" in channels:
-        prepare_email(db, batch, artifacts)
-
-
-def prepare_webhook(db, batch):
-    cfg = settings()
-    # Store small, stable batches. No network I/O occurs inside report finalization.
-    part_ids, chunk, size = [], [], 0
-
-    def save_part(values):
-        did = uid()
-        payload = {"schema_version": "1.0", "message_id": did, "report_id": batch.id,
-                   "slot": batch.slot, "part": len(part_ids) + 1, "parts": 0,
-                   "summary": batch.summary, "coverage": batch.coverage, "items": values}
-        db.add(Delivery(id=did, batch_id=batch.id, channel="webhook", part=len(part_ids) + 1, payload=payload))
-        db.flush()
-        part_ids.append(did)
-    for item in items_for(db, batch.id):
-        value = export_item(item)
-        encoded_size = len(json.dumps(value, ensure_ascii=False).encode())
-        if chunk and (len(chunk) >= cfg.webhook_batch_size or size + encoded_size > 512_000):
-            save_part(chunk)
-            chunk, size = [], 0
-        chunk.append(value)
-        size += encoded_size
-    if chunk or not part_ids:
-        save_part(chunk)
-    # Payloads are persisted per part, so retry never reconstructs a different message.
-    for did in part_ids:
-        row = db.get(Delivery, did)
-        row.payload = {**row.payload, "parts": len(part_ids)}
-        db.flush()
-
-
-def prepare_email(db, batch, artifacts):
-    cfg = settings()
-    attachments = split_csv(Path(artifacts["csv"]), cfg.smtp_max_bytes)
-    bodies = email_body_parts(batch, db, cfg.smtp_max_bytes)
-    part_count = max(len(attachments), len(bodies))
-    for offset in range(part_count):
-        attachment = attachments[offset] if offset < len(attachments) else None
-        body = bodies[offset] if offset < len(bodies) else None
-        number = offset + 1
-        db.add(Delivery(batch_id=batch.id, channel="email", part=number,
-                        payload={"slot": batch.slot, "summary": batch.summary, "coverage": batch.coverage,
-                                 "attachment": attachment, "html_body": body, "parts": part_count}))
+from .db import Delivery, now
 
 
 def canonical_body(payload):
@@ -108,11 +55,22 @@ def email_message(delivery):
     failures = [s["name"] for s in payload["coverage"] if s["enabled"] and (s["error"] or s["stale"])]
     warning = "采集不完整：" + "、".join(failures) if failures else "启用来源状态正常"
     details = Path(payload["html_body"]).read_text(encoding="utf-8") if payload.get("html_body") else ""
-    message.add_alternative(
-        f'<h1>漏洞情报</h1><p>{html.escape(payload["slot"])}</p><p>{html.escape(warning)}</p>'
-        f'<p style="white-space:pre-wrap">{html.escape(payload["summary"])}</p>'
-        f'<p>完整索引按分卷提供。<a href="{html.escape(cfg.public_base_url)}/admin/reports/{delivery.batch_id}">查看完整报告</a></p>' + details,
-        subtype="html")
+    if payload.get("schema_version") == "2.0":
+        volume = f'<p>报告编号：{html.escape(delivery.batch_id)}；第 {delivery.part} 卷，共 {payload["parts"]} 卷</p>'
+        if details:
+            body = details.replace("<!--VOLUME-->", volume)
+        else:
+            body = (f'<h1>漏洞情报索引附件</h1>{volume}<p>{html.escape(payload["slot"])}</p>'
+                    f'<p>{html.escape(payload["summary"])}</p><p>本卷提供索引附件；漏洞详情见其他分卷及管理网页完整报告。</p>')
+        from bs4 import BeautifulSoup
+        message.set_content(BeautifulSoup(body, "html.parser").get_text("\n", strip=True))
+        message.add_alternative(body, subtype="html")
+    else:
+        message.add_alternative(
+            f'<h1>漏洞情报</h1><p>{html.escape(payload["slot"])}</p><p>{html.escape(warning)}</p>'
+            f'<p style="white-space:pre-wrap">{html.escape(payload["summary"])}</p>'
+            f'<p>完整索引按分卷提供。<a href="{html.escape(cfg.public_base_url)}/admin/reports/{delivery.batch_id}">查看完整报告</a></p>' + details,
+            subtype="html")
     if payload.get("attachment"):
         attachment = Path(payload["attachment"])
         message.add_attachment(attachment.read_bytes(), maintype="text", subtype="csv", filename=attachment.name)

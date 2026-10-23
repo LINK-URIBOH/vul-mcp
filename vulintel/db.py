@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from .config import settings
@@ -142,6 +142,62 @@ class Migration(Base):
     applied: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 
+class MetadataState(Base):
+    __tablename__ = "metadata_state"
+    key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    value: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class Revision(Base):
+    """Immutable facts; canonical linkage can change after a late alias merge."""
+    __tablename__ = "vulnerability_revisions"
+    __table_args__ = (Index("revision_identity_watermark", "vulnerability_id", "id"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vulnerability_id: Mapped[str] = mapped_column(String(36), index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    first_seen_at: Mapped[datetime | None] = mapped_column(DateTime)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    important_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    snapshot_bytes: Mapped[int] = mapped_column(Integer)
+    snapshot: Mapped[dict] = mapped_column(JSON)
+
+
+class ReportState(Base):
+    __tablename__ = "report_states"
+    batch_id: Mapped[str] = mapped_column(ForeignKey("batches.id"), primary_key=True)
+    policy: Mapped[int] = mapped_column(Integer, default=2)
+    watermark: Mapped[int | None] = mapped_column(Integer)
+    cursor: Mapped[int] = mapped_column(Integer, default=0)
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    new_count: Mapped[int] = mapped_column(Integer, default=0)
+    update_count: Mapped[int] = mapped_column(Integer, default=0)
+    unknown_count: Mapped[int] = mapped_column(Integer, default=0)
+    coverage_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    overview: Mapped[dict] = mapped_column(JSON, default=dict)
+    work: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ReportSelection(Base):
+    __tablename__ = "report_selections"
+    item_id: Mapped[int] = mapped_column(ForeignKey("batch_items.id"), primary_key=True)
+    revision_id: Mapped[int] = mapped_column(ForeignKey("vulnerability_revisions.id"), index=True)
+    group_name: Mapped[str] = mapped_column(String(160), index=True)
+    rank: Mapped[int] = mapped_column(Integer)
+    category: Mapped[str] = mapped_column(String(30))
+
+
+class UnverifiedItem(Base):
+    __tablename__ = "unverified_report_items"
+    __table_args__ = (UniqueConstraint("batch_id", "revision_id"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    batch_id: Mapped[str] = mapped_column(ForeignKey("batches.id"), index=True)
+    revision_id: Mapped[int] = mapped_column(ForeignKey("vulnerability_revisions.id"))
+    title: Mapped[str] = mapped_column(Text)
+    identifiers: Mapped[str] = mapped_column(Text)
+    references: Mapped[list] = mapped_column(JSON, default=list)
+
+
 def build_engine(url):
     kwargs = {"pool_pre_ping": True}
     if not url.startswith("sqlite"):
@@ -170,7 +226,17 @@ def migrate():
     with engine().begin() as conn:
         if conn.dialect.name == "postgresql":
             conn.exec_driver_sql("SELECT pg_advisory_xact_lock(86221022)")
-        Base.metadata.create_all(conn)
         from sqlalchemy import select
-        if conn.execute(select(Migration.version)).scalar() is None:
+        Migration.__table__.create(conn, checkfirst=True)
+        versions = set(conn.execute(select(Migration.version)).scalars())
+        if versions - {1, 2} or (2 in versions and 1 not in versions):
+            raise ValueError("数据库迁移版本不兼容，拒绝自动修改")
+        if 1 not in versions:
+            for table in [Source, Vulnerability, Alias, SourceRecord, Batch, BatchItem, Delivery,
+                          Job, Audit, LoginFlow, WebSession]:
+                table.__table__.create(conn, checkfirst=True)
             conn.execute(Migration.__table__.insert().values(version=1, applied=now()))
+        if 2 not in versions:
+            from .migrations import migration_002
+            migration_002(conn)
+            conn.execute(Migration.__table__.insert().values(version=2, applied=now()))

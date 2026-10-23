@@ -6,14 +6,17 @@ import pytest
 from sqlalchemy import func, select
 
 from vulintel.config import settings
-from vulintel.db import Alias, Batch, BatchItem, Delivery, Source, SourceRecord, Vulnerability, now
+from vulintel.db import Alias, Batch, BatchItem, Delivery, Revision, Source, SourceRecord, Vulnerability, now
 from vulintel.delivery import canonical_body, deliver_one, email_message, send_webhook, signature
 from vulintel.reports import report_dir
-from vulintel.service import Analysis, batch_page, due_slot, finalize, ingest, open_batch, submit_analysis
+from vulintel.service import Analysis, batch_page, due_slot, ingest, submit_analysis
+from report_helpers import finalize, open_batch
 from vulintel.sources import collect_one, entry, ghsa_record, kev_record, nvd_record, osv_record
 
 
 def record(alias="CVE-2026-12345", **kwargs):
+    cutoff = datetime.fromisoformat(due_slot()).replace(tzinfo=None) - timedelta(hours=8)
+    kwargs.setdefault("published", (cutoff - timedelta(days=1)).isoformat() + "Z")
     return entry(alias, "示例漏洞", "原始公告", [alias], ["https://example.org/advisory"],
                  [{"product": "Python"}], severity="high", **kwargs)
 
@@ -22,13 +25,14 @@ def prepared_batch(db):
     vid = ingest(db, "nvd", record())
     cutoff = datetime.fromisoformat(due_slot()).replace(tzinfo=None) - timedelta(hours=8)
     db.get(Vulnerability, vid).updated_at = cutoff - timedelta(seconds=1)
+    db.scalar(select(Revision).where(Revision.vulnerability_id == vid)).observed_at = cutoff - timedelta(seconds=1)
     db.commit()
     bid = open_batch(db, "tester")["batch_id"]
     return bid, db.scalar(select(BatchItem).where(BatchItem.batch_id == bid))
 
 
 def analysis(item_id):
-    return Analysis(item_id=item_id, root_cause="厂商未公开", trigger_conditions="需要受影响版本",
+    return Analysis(item_id=item_id, vulnerability_summary="示例漏洞的中文说明", root_cause="厂商未公开", trigger_conditions="需要受影响版本",
                     impact="可能造成拒绝服务", affected_versions="见原始公告", attack_path="入口条件尚未确认",
                     remediation="按厂商公告升级", evidence_level="unknown", evidence_notes="尚未独立验证",
                     references=["https://example.org/advisory"])
@@ -71,7 +75,7 @@ def test_batch_pagination_resume_finalize_idempotent(store):
         assert open_batch(db, "tester")["batch_id"] == bid
         page = batch_page(db, bid)
         assert page["pending_analysis"] == 1 and page["items"][0]["item_id"] == item.id
-        with pytest.raises(ValueError, match="still require"):
+        with pytest.raises(ValueError, match="需要完成逐条详解"):
             finalize(db, "tester", bid, "摘要")
         submit_analysis(db, "tester", bid, [analysis(item.id)])
         submit_analysis(db, "tester", bid, [analysis(item.id)])
@@ -207,6 +211,7 @@ def test_partitioned_webhook_and_resumable_pages(store, monkeypatch):
         for number in range(5):
             vid = ingest(db, "nvd", record(f"CVE-2026-{20000 + number}"))
             db.get(Vulnerability, vid).updated_at = cutoff - timedelta(seconds=1)
+            db.scalar(select(Revision).where(Revision.vulnerability_id == vid)).observed_at = cutoff - timedelta(seconds=1)
         db.commit()
         bid = open_batch(db, "test")["batch_id"]
         processed = set()

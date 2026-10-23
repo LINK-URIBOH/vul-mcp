@@ -14,3 +14,21 @@
 若资源不足，先外置Keycloak（及其数据库）或扩大服务器；不要去除认证或改用Keycloak开发数据库。也可停用明确不需要的预置来源，但这会减少监测范围，必须在报告中保留停用状态。
 
 首次镜像构建可能比运行需要更多内存。小服务器可在其他Linux机器构建镜像后推送到自己的仓库，再部署固定镜像。
+
+## 报告队列定点验证
+
+`scripts/report_benchmark.py`使用十万条合成记录，对照旧的整批ORM累积路径与新的后台分页路径；详见 `VALIDATION_v1.1.0.md`。只能连接独立测试数据库 `report_benchmark`，不能使用生产数据库或凭据。测试要求投递总开关关闭，不发送真实通知。
+
+示例（已经建立隔离PostgreSQL测试库并构建应用镜像后）：
+
+```bash
+docker run --rm --memory 256m --cpus 0.5 --network <隔离测试网络> \
+  -e DATABASE_URL=postgresql+psycopg://<测试账号>:<测试密码>@<测试数据库>:5432/report_benchmark \
+  -e DELIVERY_ENABLED=false -e DATA_DIR=/data \
+  -v <独立测试报告卷>:/data vul-intel:1.1.0 \
+  python -m scripts.report_benchmark
+```
+
+脚本验证真实MCP初始化、签名JWT校验及工具流程，并在PostgreSQL上并发创建同一批次；检查选中、分析、导出数量及MIME大小。签名密钥仅供测试，不代替生产Keycloak登录和续期验收。`--legacy-repro`用于隔离环境复现旧路径容量风险，可能被容器OOM终止，禁止用于生产。正常流程还应验证：长采集每20条已提交记录之间推进报告；重启后从检查点恢复，文件不完整时拒绝发布。
+
+256 MiB应用与256 MiB数据库的定点通过，仅证明该合成负载；不等于2 GB整机四服务长期负载已经通过。部署后仍须执行本文件前述组合验收。

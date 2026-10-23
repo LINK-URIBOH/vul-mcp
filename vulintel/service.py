@@ -1,13 +1,15 @@
 import hashlib
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, select, update
 
-from .db import Alias, Audit, Batch, BatchItem, Delivery, Source, SourceRecord, Vulnerability, now, uid
+from .db import (Alias, Audit, Batch, BatchItem, Delivery, MetadataState, ReportState, Revision,
+                 Source, SourceRecord, Vulnerability, now, uid)
 from .sources import RANK
 
 
@@ -38,6 +40,7 @@ def ingest(db, source_id, data):
         for other in ids[1:]:
             db.execute(update(Alias).where(Alias.vulnerability_id == other).values(vulnerability_id=vuln.id))
             db.execute(update(SourceRecord).where(SourceRecord.vulnerability_id == other).values(vulnerability_id=vuln.id))
+            db.execute(update(Revision).where(Revision.vulnerability_id == other).values(vulnerability_id=vuln.id))
             # Historical batch snapshots deliberately retain their immutable original identity.
             db.execute(delete(Vulnerability).where(Vulnerability.id == other))
     else:
@@ -64,17 +67,25 @@ def ingest(db, source_id, data):
               "exploited": any(r.data.get("exploited", False) for r in records),
               "references": sorted({url for r in records for url in r.data.get("references", [])}),
               "source_records": [{"source": r.source_id, **r.data} for r in ordered]}
+    previous = vuln.data
     vuln.data = merged
     vuln.title = main["title"]
     vuln.product = " ".join(sorted({json.dumps(r.data.get("affected", []), ensure_ascii=False) for r in records}))
     vuln.severity, vuln.exploited = severity, merged["exploited"]
     vuln.updated_at = now()
+    from .timeline import append_revision
+    append_revision(db, vuln, previous=previous)
     return vuln.id
 
 
 def source_status(db):
+    progress = {s.key.split(":", 1)[1]: s.value for s in db.scalars(
+        select(MetadataState).where(MetadataState.key.like("source-progress:%")))}
     return [{"id": s.id, "name": s.name, "enabled": s.enabled,
              "last_success_utc": s.last_success.isoformat() + "Z" if s.last_success else None,
+             "last_attempt_utc": s.last_attempt.isoformat() + "Z" if s.last_attempt else None,
+             "next_run_utc": s.next_run.isoformat() + "Z" if s.next_run else None,
+             "progress": progress.get(s.id, {}),
              "error": s.error,
              "stale": not s.last_success or (now() - s.last_success) > timedelta(hours=2)}
             for s in db.scalars(select(Source).order_by(Source.id))]
@@ -92,65 +103,19 @@ def due_slot():
 
 
 def open_batch(db, actor, slot=None):
-    slot = slot or due_slot()
-    cutoff = datetime.fromisoformat(slot)
-    if (cutoff.tzinfo is None or cutoff.utcoffset() != timedelta(hours=8) or cutoff.hour not in {9, 18}
-            or cutoff.minute or cutoff.second or cutoff.microsecond):
-        raise ValueError("Slot must be YYYY-MM-DDT09:00+08:00 or YYYY-MM-DDT18:00+08:00")
-    cutoff = cutoff.astimezone(timezone.utc).replace(tzinfo=None)
-    if cutoff > now():
-        raise ValueError("Cannot create a future report slot")
-    slot = cutoff.replace(tzinfo=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai")).isoformat(timespec="minutes")
-    if db.bind.dialect.name == "postgresql":
-        db.execute(select(func.pg_advisory_xact_lock(86221023)))
-    existing = db.scalar(select(Batch).where(Batch.slot == slot))
-    if existing:
-        return {"batch_id": existing.id, "slot": existing.slot, "status": existing.status}
-    pending = db.scalar(select(Batch).where(Batch.status != "finalized").order_by(Batch.cutoff))
-    if pending:
-        return {"batch_id": pending.id, "slot": pending.slot, "status": pending.status,
-                "note": "Resume the unfinished batch before opening a later slot"}
-    last = db.scalar(select(Batch).where(Batch.status == "finalized").order_by(Batch.cutoff.desc()))
-    if last and cutoff <= last.cutoff:
-        raise ValueError("Slot precedes the last finalized report")
-    batch = Batch(id=uid(), slot=slot, cutoff=cutoff, coverage=source_status(db))
-    db.add(batch)
-    db.flush()
-    query = select(Vulnerability).where(Vulnerability.updated_at <= cutoff)
-    if last:
-        query = query.where(Vulnerability.updated_at > last.cutoff)
-    for vuln in db.scalars(query.execution_options(yield_per=50)):
-        priority = vuln.exploited or vuln.severity in {"high", "critical", "unknown"} or bool(last)
-        # All changes after a previous report are reviewed, so patch/exploit updates aren't missed.
-        db.add(BatchItem(batch_id=batch.id, vulnerability_id=vuln.id, snapshot=vuln.data, priority=priority))
-    audit(db, actor, "batch.create", batch.id)
-    db.commit()
-    return {"batch_id": batch.id, "slot": batch.slot, "status": batch.status}
+    from .report_jobs import open_batch as invoke
+    return invoke(db, actor, slot)
 
 
 def batch_page(db, batch_id, after=0, limit=10, pending_only=False):
-    batch = db.get(Batch, batch_id)
-    if not batch:
-        raise ValueError("Unknown batch")
-    if limit < 1 or limit > 20 or after < 0:
-        raise ValueError("Invalid pagination")
-    query = select(BatchItem).where(BatchItem.batch_id == batch_id, BatchItem.id > after)
-    if pending_only:
-        query = query.where(BatchItem.priority.is_(True), BatchItem.analysis.is_(None))
-    items = list(db.scalars(query.order_by(BatchItem.id).limit(limit + 1)))
-    page = items[:limit]
-    pending = db.scalar(select(func.count()).select_from(BatchItem).where(
-        BatchItem.batch_id == batch_id, BatchItem.priority.is_(True), BatchItem.analysis.is_(None)))
-    return {"batch_id": batch_id, "status": batch.status, "slot": batch.slot,
-            "coverage": batch.coverage, "pending_analysis": pending,
-            "items": [{"item_id": i.id, "priority": i.priority, "snapshot": i.snapshot,
-                       "analysis": i.analysis} for i in page],
-            "next_after": page[-1].id if len(items) > limit else None}
+    from .report_jobs import batch_page as invoke
+    return invoke(db, batch_id, after, limit, pending_only)
 
 
 class Analysis(BaseModel):
     model_config = ConfigDict(extra="forbid")
     item_id: int
+    vulnerability_summary: str = Field(default="", max_length=8000)
     root_cause: str = Field(min_length=1, max_length=8000)
     trigger_conditions: str = Field(min_length=1, max_length=8000)
     impact: str = Field(min_length=1, max_length=8000)
@@ -167,21 +132,46 @@ class Analysis(BaseModel):
         from urllib.parse import urlsplit
         for value in values:
             parsed = urlsplit(value)
-            if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                    or len(value.encode("utf-8")) > 2048):
                 raise ValueError("Evidence references must be public HTTPS URLs")
+        return values
+
+
+class Overview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    risk_summary: list[str] = Field(default_factory=list, max_length=6,
+                                    description="仅描述漏洞核心风险，不包含工具调用、分页、执行或投递过程")
+    repair_priorities: list[str] = Field(default_factory=list, max_length=10,
+                                         description="仅描述具体修复优先级，不重复服务器生成的计数和采集状态")
+
+    @field_validator("risk_summary", "repair_priorities")
+    @classmethod
+    def bounded_bullets(cls, values):
+        if any(not value.strip() or len(value) > 600 for value in values):
+            raise ValueError("每条风险或修复建议须为 1..600 字符")
+        if any(re.search(r"open_report_batch|pending_analysis|next_after|batch_id|submit_batch_analysis|finalize_report|MCP\s*-32603", value, re.I) for value in values):
+            raise ValueError("风险摘要或修复建议不得包含工具执行诊断")
         return values
 
 
 def submit_analysis(db, actor, batch_id, analyses):
     batch = db.scalar(select(Batch).where(Batch.id == batch_id).with_for_update())
     if not batch or batch.status == "finalized":
-        raise ValueError("Batch is missing or finalized")
+        raise ValueError("批次不存在或已经归档")
+    state = db.get(ReportState, batch_id)
+    if state and (not state.work.get("prepared") or batch.status != "analyzing"):
+        raise ValueError("批次尚未准备完成，或已进入渲染阶段")
     prepared = []
     for raw in analyses:
         analysis = raw if isinstance(raw, Analysis) else Analysis.model_validate(raw)
+        if state and not re.search(r"[\u3400-\u9fff]", analysis.vulnerability_summary):
+            raise ValueError("每条记录必须提供中文漏洞说明 vulnerability_summary")
+        if state and len(json.dumps(analysis.model_dump(), ensure_ascii=False).encode()) > 192000:
+            raise ValueError("单条分析总量超过192000字节，请精简表述后重新提交，不删减关键证据")
         item = db.get(BatchItem, analysis.item_id)
         if not item or item.batch_id != batch_id:
-            raise ValueError("Analysis references an item outside this batch")
+            raise ValueError("分析引用了不属于此批次的条目")
         prepared.append((item, analysis.model_dump(exclude={"item_id"})))
     for item, data in prepared:
         item.analysis = data
@@ -199,27 +189,9 @@ def mark_batch_failed(db, actor, batch_id, error_type):
         db.commit()
 
 
-def finalize(db, actor, batch_id, summary):
-    from .delivery import prepare_deliveries
-    from .reports import render_report
-    batch = db.scalar(select(Batch).where(Batch.id == batch_id).with_for_update())
-    if not batch:
-        raise ValueError("Unknown batch")
-    if batch.status == "finalized":
-        return {"batch_id": batch_id, "status": "finalized", "note": "Already finalized; not resent"}
-    missing = db.scalar(select(func.count()).select_from(BatchItem).where(
-        BatchItem.batch_id == batch_id, BatchItem.priority.is_(True), BatchItem.analysis.is_(None)))
-    if missing:
-        raise ValueError(f"{missing} priority items still require analysis")
-    batch.summary = summary
-    count = db.scalar(select(func.count()).select_from(BatchItem).where(BatchItem.batch_id == batch_id))
-    artifacts = render_report(batch, db)
-    # Artifacts are reproducible; DB transaction makes the final state + delivery rows atomic.
-    prepare_deliveries(db, batch, None, artifacts)
-    batch.status, batch.error = "finalized", None
-    audit(db, actor, "batch.finalize", batch_id)
-    db.commit()
-    return {"batch_id": batch_id, "status": "finalized", "items": count}
+def finalize(db, actor, batch_id, summary="", overview=None):
+    from .report_jobs import finalize as invoke
+    return invoke(db, actor, batch_id, summary, overview)
 
 
 def delivery_status(db, batch_id):

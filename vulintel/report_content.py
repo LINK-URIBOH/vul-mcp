@@ -1,0 +1,111 @@
+"""Shared, escaped Chinese report content for browser, downloads and MIME HTML."""
+import html
+from datetime import timedelta, timezone
+from urllib.parse import urlsplit
+from .config import settings
+
+SEVERITY = {"critical": "严重", "high": "高危", "medium": "中危", "low": "低危", "unknown": "未评分"}
+EVIDENCE = {"vendor_confirmed": "厂商确认", "public_poc": "公开 PoC", "third_party_verified": "第三方验证",
+            "inference": "推测", "unknown": "未确认"}
+FIELDS = {"vulnerability_summary": "漏洞说明", "root_cause": "漏洞原理", "trigger_conditions": "触发条件",
+          "impact": "影响", "affected_versions": "影响范围与版本", "attack_path": "攻击路径",
+          "remediation": "修复版本与缓解措施", "evidence_level": "证据等级", "evidence_notes": "证据说明"}
+ESC = html.escape
+FONT = "'Microsoft YaHei','PingFang SC','Noto Sans CJK SC',sans-serif"
+
+
+def label_time(value, precision=None):
+    from .timeline import stamp
+    parsed = stamp(value)
+    if parsed is None:
+        return "未确认"
+    if precision == "day":
+        return parsed.strftime("%Y-%m-%d") + "（仅到日；上游未提供时刻）"
+    return (parsed + timedelta(hours=8)).strftime("%Y-%m-%d %H:%M") + "（北京时间）"
+
+
+def text(value):
+    return ESC(str(value or "未公开／未确认")).replace("\n", "<br>")
+
+
+def references(values):
+    result = []
+    for value in sorted(set(values)):
+        parsed = urlsplit(value)
+        safe = parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password
+        result.append('<li style="overflow-wrap:anywhere">' +
+                      (f'<a style="color:#174b76" href="{ESC(value, quote=True)}">{ESC(value)}</a>' if safe else ESC(value)) + "</li>")
+    return "<ul>" + "".join(result) + "</ul>"
+
+
+def header(batch, state):
+    start = batch.cutoff - timedelta(days=7)
+    title = label_time(batch.cutoff.replace(tzinfo=timezone.utc).isoformat())
+    overview = state.overview or {}
+    result = (f'<div style="font-family:{FONT};color:#183047;line-height:1.75;max-width:860px;margin:0 auto;padding:20px">'
+              '<header style="border-top:6px solid #173b61;padding:12px 0 18px;border-bottom:1px solid #bdcbd8">'
+              f'<h1 style="font-size:27px;margin:8px 0">漏洞情报报告</h1><p>{ESC(title)}</p>'
+              f'<p style="font-size:12px;color:#50677a;overflow-wrap:anywhere">报告编号：{ESC(batch.id)}</p>'
+              f'<p><a style="color:#174b76" href="{ESC(settings().public_base_url)}/admin/reports/{ESC(batch.id)}/view">阅读网页版完整报告</a></p></header>'
+              '<!--VOLUME--><section><h2 style="font-size:20px">风险概览</h2>'
+              f'<p>本报告逐条详解 <strong>{state.total}</strong> 条：近期公开 {state.new_count} 条，'
+              f'重要更新 {state.update_count} 条。另有 {state.unknown_count} 条公开日期待核实，未混入近期公开。</p>'
+              f'<p style="font-size:13px;color:#50677a">首次补报公开窗口：{ESC(label_time(start))} 至 {ESC(label_time(batch.cutoff))}。'
+              '后续仅报告未覆盖记录和重要变化。</p>')
+    for key, label in [("risk_summary", "核心风险"), ("repair_priorities", "优先修复建议")]:
+        bullets = overview.get(key, [])
+        if bullets:
+            result += f'<h3 style="font-size:16px">{label}</h3><ul>' + "".join(f"<li>{text(v)}</li>" for v in bullets) + "</ul>"
+    if not state.total:
+        result += '<p style="padding:12px;border-left:4px solid #b47416;background:#fff5df">本批次未取得符合条件的记录。此结论限于筛选窗口和已采集数据，不能据此断言公开漏洞没有新增。</p>'
+    return result + "</section>"
+
+
+def article(item):
+    facts, analysis = item.snapshot, item.analysis or {}
+    severity = SEVERITY.get(facts.get("severity"), "未评分")
+    identifiers = ", ".join(facts.get("aliases", [])) or "暂无公开编号"
+    if facts.get("mentioned_cves"):
+        identifiers += "；关联 CVE（非别名）：" + ", ".join(facts["mentioned_cves"])
+    category = "近期公开" if facts.get("report_category") == "new" else "重要更新"
+    timeline = facts.get("timeline", {})
+    result = (f'<article id="item-{item.id}" style="padding:18px 0;border-bottom:1px solid #cad5df;break-inside:avoid">'
+              f'<h3 style="font-size:20px;margin:6px 0;overflow-wrap:anywhere">{text(facts["title"])}</h3>'
+              f'<p>产品：{text(facts.get("product_group"))}</p><p style="color:#8e3128;font-weight:600">{ESC(severity)}　{category}　已利用：'
+              f'{"是" if facts.get("exploited") else "未确认"}</p><p style="overflow-wrap:anywhere">编号：{ESC(identifiers)}</p>'
+              f'<p style="font-size:13px;color:#50677a">公开时间：{ESC(label_time(timeline.get("published_at"), timeline.get("publication_precision")))}<br>'
+              f'时间依据：{text(timeline.get("publication_basis"))}；来源：{text(timeline.get("publication_source"))}<br>'
+              f'上游更新时间：{ESC(label_time(timeline.get("upstream_updated_at")))}<br>'
+              f'重要变化时间：{ESC(label_time(timeline.get("material_changed_at")))}；依据：{text(timeline.get("change_basis"))}</p>')
+    for field, label in FIELDS.items():
+        value = analysis.get(field) or "未公开／未确认"
+        if field == "evidence_level":
+            value = EVIDENCE.get(value, "未确认")
+        result += f'<h4 style="font-size:15px;margin:16px 0 4px;color:#173b61">{label}</h4><p style="margin:0;overflow-wrap:anywhere">{text(value)}</p>'
+    return result + '<h4 style="font-size:15px;color:#173b61">参考来源</h4>' + references(
+        list(facts.get("references", [])) + list(analysis.get("references", []))) + "</article>"
+
+
+def markdown_article(item):
+    facts, analysis = item.snapshot, item.analysis or {}
+    result = f'### {ESC(facts["title"])}\n\n编号：{ESC(", ".join(facts.get("aliases", [])))}\n\n'
+    result += f'严重性：{SEVERITY.get(facts.get("severity"), "未评分")}；已利用：{"是" if facts.get("exploited") else "未确认"}\n\n'
+    timeline = facts.get("timeline", {})
+    result += f'公开时间：{label_time(timeline.get("published_at"), timeline.get("publication_precision"))}；时间依据：{ESC(timeline.get("publication_basis", "未确认"))}\n\n'
+    result += f'上游更新时间：{label_time(timeline.get("upstream_updated_at"))}\n\n'
+    for field, label in FIELDS.items():
+        value = analysis.get(field) or "未公开／未确认"
+        if field == "evidence_level":
+            value = EVIDENCE.get(value, "未确认")
+        result += f'#### {label}\n\n{ESC(value)}\n\n'
+    return result + "参考来源：\n\n" + "".join("- " + ESC(url) + "\n" for url in sorted(set(
+        list(facts.get("references", [])) + list(analysis.get("references", []))))) + "\n"
+
+
+def coverage(batch, state):
+    result = f'<section><h2 style="font-size:20px">采集覆盖</h2><p>状态快照：{ESC(label_time(state.coverage_at))}；不代表当前实时状态。</p>'
+    result += '<div style="overflow-x:auto"><table style="border-collapse:collapse;width:100%;font-size:13px"><tr><th align="left">来源</th><th align="left">状态</th><th align="left">最近成功（北京时间）</th></tr>'
+    for source in batch.coverage:
+        label = "停用" if not source["enabled"] else ("失败" if source["error"] else ("过期" if source["stale"] else "正常"))
+        result += f'<tr><td style="padding:6px;border-bottom:1px solid #dbe2e9">{text(source["name"])}</td><td>{label}</td><td>{ESC(label_time(source.get("last_success_utc")))}</td></tr>'
+    return result + '</table></div><p>失败或过期来源存在覆盖缺口，不等于没有新增漏洞。详细采集错误和任务诊断见管理页。</p></section>'

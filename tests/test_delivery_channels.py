@@ -7,7 +7,7 @@ from sqlalchemy import select
 from vulintel.config import Settings, settings
 from vulintel.db import Delivery, now
 from vulintel.delivery import deliver_one
-from vulintel.service import finalize, open_batch
+from report_helpers import finalize, open_batch
 
 
 SMTP = {"smtp_host": "smtp.example.org", "smtp_from": "sender@example.org", "smtp_to": "to@example.org"}
@@ -50,9 +50,9 @@ def configure(monkeypatch, channels, enabled):
 def test_finalize_queues_only_configured_channels_and_stays_idempotent(store, monkeypatch, channels):
     configure(monkeypatch, channels, enabled=False)
     if "email" not in channels:
-        monkeypatch.setattr("vulintel.delivery.prepare_email", lambda *args: pytest.fail("Email preparation called"))
+        monkeypatch.setattr("vulintel.report_render.mail_part", lambda *args: pytest.fail("Email preparation called"))
     if "webhook" not in channels:
-        monkeypatch.setattr("vulintel.delivery.prepare_webhook", lambda *args: pytest.fail("Webhook preparation called"))
+        monkeypatch.setattr("vulintel.report_render.save_webhook", lambda *args: pytest.fail("Webhook preparation called"))
     with store() as db:
         bid = open_batch(db, "test")["batch_id"]
         finalize(db, "test", bid, "渠道选择测试")

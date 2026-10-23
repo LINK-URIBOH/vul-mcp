@@ -15,7 +15,7 @@ from starlette.routing import Route
 
 from .auth import token_hash
 from .config import settings
-from .db import (Alias, Audit, Batch, BatchItem, Delivery, Job, LoginFlow, Source, Vulnerability,
+from .db import (Alias, Audit, Batch, BatchItem, Delivery, Job, LoginFlow, ReportState, Source, Vulnerability,
                  WebSession, now, session)
 from .reports import report_dir
 from .service import audit, source_status
@@ -25,6 +25,7 @@ TEMPLATES = Environment(loader=FileSystemLoader(Path(__file__).parent / "templat
 STATUS_LABELS = {"critical": "严重", "high": "高危", "medium": "中危", "low": "低危", "unknown": "未评分",
                  "pending": "排队", "sending": "发送中", "sent": "已发送", "failed": "失败",
                  "running": "运行中", "done": "完成", "analyzing": "分析中", "finalized": "已归档",
+                 "preparing": "准备中", "rendering": "生成文件中", "staged": "待统一发布",
                  "email": "邮件", "webhook": "Webhook"}
 TEMPLATES.filters["statuslabel"] = lambda value: STATUS_LABELS.get(value, value) if isinstance(value, str) else value
 
@@ -176,7 +177,7 @@ async def detail(request):
             BatchItem.vulnerability_id == record.id, Batch.status == "finalized", BatchItem.analysis.is_not(None))
             .order_by(Batch.cutoff.desc()).limit(1))
         from .reports import LABELS
-        narrative = [(label, latest.analysis[key]) for key, label in LABELS.items()] if latest else []
+        narrative = [(label, latest.analysis.get(key, "未公开／未确认")) for key, label in LABELS.items()] if latest else []
         return page(request, identity, record.title, vulnerability=record.data, narrative=narrative,
                     raw_detail=json.dumps(record.data, ensure_ascii=False, indent=2))
 
@@ -196,8 +197,13 @@ async def reports(request):
             return RedirectResponse("/admin/login", status_code=303)
         offset = offset_page(request)
         records = list(db.scalars(select(Batch).order_by(Batch.cutoff.desc()).offset(offset).limit(101)))
+        counts = {row.batch_id: row for row in db.execute(select(ReportState.batch_id, ReportState.total,
+                  ReportState.new_count, ReportState.update_count, ReportState.unknown_count).where(
+                      ReportState.batch_id.in_([record.id for record in records])))}
         return page(request, identity, "报告归档", columns=["时间段（北京时间）", "状态", "摘要"],
-                    rows=[{"cells": [b.slot, b.status, b.summary], "link": "/admin/reports/" + b.id} for b in records[:100]],
+                    rows=[{"cells": [b.slot, b.status,
+                           f"逐条详解 {counts[b.id].total} 条；日期待核实 {counts[b.id].unknown_count} 条" if b.id in counts else "旧规则历史报告"],
+                           "link": "/admin/reports/" + b.id} for b in records[:100]],
                     next_url=f"?offset={offset + 100}" if len(records) > 100 else None)
 
 
@@ -211,15 +217,22 @@ async def report_detail(request):
             raise HTTPException(404)
         pending = db.scalar(select(func.count()).select_from(BatchItem).where(
             BatchItem.batch_id == batch.id, BatchItem.priority.is_(True), BatchItem.analysis.is_(None)))
-        return page(request, identity, "报告 · " + batch.slot, summary=batch.summary,
-                    detail=f"状态：{batch.status}；待分析重点条目：{pending}。{batch.error or ''} 未完成批次将在下一次云端运行时恢复。",
+        state = db.get(ReportState, batch.id)
+        from .report_jobs import status as report_status
+        progress = report_status(db, batch)
+        return page(request, identity, "报告 · " + batch.slot,
+                    summary=(f"近期公开 {state.new_count} 条；重要更新 {state.update_count} 条；日期待核实 {state.unknown_count} 条。" if state else "旧规则历史报告，保留原始归档。"),
+                    diagnostic_summary=batch.summary,
+                    report_view=f"/admin/reports/{batch.id}/view" if batch.status == "finalized" else None,
+                    detail=f"状态：{STATUS_LABELS.get(batch.status, batch.status)}；总数：{progress.get('total', '未知')}；待逐条分析：{progress.get('pending_analysis', pending)}。{batch.error or ''} 未完成批次可继续恢复。",
                     downloads=[{"label": label, "url": f"/admin/reports/{batch.id}/download/{kind}"}
-                               for kind, label in [("html", "HTML"), ("markdown", "Markdown"), ("json", "JSON"), ("csv", "完整索引")]]
+                               for kind, label in [("html", "HTML"), ("markdown", "Markdown"), ("json", "JSON"), ("csv", "完整索引")]
+                               + ([("unverified", "日期待核实清单")] if state else [])]
                     if batch.status == "finalized" else [], coverage=batch.coverage)
 
 
 async def download(request):
-    kinds = {"html": "report.html", "markdown": "report.md", "json": "report.json", "csv": "index.csv"}
+    kinds = {"html": "report.html", "markdown": "report.md", "json": "report.json", "csv": "index.csv", "unverified": "unverified.csv"}
     with session() as db:
         if not admin_session(request, db):
             return RedirectResponse("/admin/login", status_code=303)
@@ -232,14 +245,31 @@ async def download(request):
         return FileResponse(path, filename=path.name, headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
 
+async def report_view(request):
+    with session() as db:
+        if not admin_session(request, db):
+            return RedirectResponse("/admin/login", status_code=303)
+        batch = db.get(Batch, request.path_params["bid"])
+        if not batch or batch.status != "finalized":
+            raise HTTPException(404)
+        path = report_dir(batch.id) / "report.html"
+        if not path.is_file():
+            raise HTTPException(404)
+        return FileResponse(path, media_type="text/html", headers={"Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'self'; base-uri 'none'"})
+
+
 async def sources(request):
     with session() as db:
         identity = admin_session(request, db)
         if not identity:
             return RedirectResponse("/admin/login", status_code=303)
         values = list(db.scalars(select(Source).order_by(Source.id)))
-        return page(request, identity, "采集来源", columns=["来源", "状态", "最后成功（UTC）", "下次采集/重试（UTC）", "错误"],
+        status_map = {row["id"]: row for row in source_status(db)}
+        return page(request, identity, "采集来源", columns=["来源", "状态", "成功窗口终点（UTC）", "实际完成（UTC）", "任务进度", "下次采集/重试（UTC）", "错误"],
                     rows=[{"cells": [s.name, "启用" if s.enabled else "停用", s.last_success or "尚未采集",
+                                      status_map[s.id]["progress"].get("completed_at", "尚无实际完成记录"),
+                                      str(status_map[s.id]["progress"].get("status", "—")) + " / " + str(status_map[s.id]["progress"].get("processed", 0)),
                                       s.next_run if s.enabled else "—", s.error or "—"],
                            "actions": [{"label": "停用" if s.enabled else "启用", "url": f"/admin/actions/source/{s.id}/toggle"},
                                        {"label": "补采", "url": f"/admin/actions/source/{s.id}/collect"}]} for s in values])
@@ -331,6 +361,7 @@ def routes():
     return [Route("/admin/", dashboard), Route("/admin/login", login), Route("/admin/callback", callback),
             Route("/admin/logout", logout, methods=["POST"]), Route("/admin/vulnerabilities", vulnerabilities),
             Route("/admin/vulnerabilities/{vid}", detail), Route("/admin/reports", reports),
-            Route("/admin/reports/{bid}/download/{kind}", download), Route("/admin/reports/{bid}", report_detail),
+            Route("/admin/reports/{bid}/download/{kind}", download), Route("/admin/reports/{bid}/view", report_view),
+            Route("/admin/reports/{bid}", report_detail),
             Route("/admin/sources", sources), Route("/admin/tasks", tasks), Route("/admin/deliveries", deliveries),
             Route("/admin/actions/{kind}/{target}/{operation}", action, methods=["POST"])]

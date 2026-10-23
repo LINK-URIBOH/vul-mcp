@@ -18,6 +18,8 @@
 <label>已利用<select name="exploited"><option value="">全部</option><option value="yes" {% if filters.get('exploited') == 'yes' %}selected{% endif %}>是</option><option value="no" {% if filters.get('exploited') == 'no' %}selected{% endif %}>未确认</option></select></label>
 <label>开始日期<input type="date" name="since" value="{{ filters.get('since','') }}"></label><label>结束日期<input type="date" name="until" value="{{ filters.get('until','') }}"></label><button>筛选记录</button></form>{% endif %}
 {% if summary %}<section class="summary"><h2>摘要</h2><p>{{ summary }}</p></section>{% endif %}
+{% if report_view %}<p><a href="{{ report_view }}" target="_blank" rel="noopener">阅读完整报告</a></p><iframe class="report-frame" title="完整漏洞报告" src="{{ report_view }}"></iframe>{% endif %}
+{% if diagnostic_summary %}<details><summary>查看旧摘要／执行诊断（不属于正式报告正文）</summary><p>{{ diagnostic_summary }}</p></details>{% endif %}
 {% if downloads %}<div class="downloads">{% for file in downloads %}<a href="{{ file.url }}">下载 {{ file.label }}</a>{% endfor %}</div>{% endif %}
 {% if detail %}<section class="detail"><pre>{{ detail }}</pre></section>{% endif %}
 {% if vulnerability %}<section class="summary"><p>{{ vulnerability.aliases|join(', ') }} · {{ vulnerability.severity|statuslabel }} · 已利用：{{ '是' if vulnerability.exploited else '未确认' }}</p><h2>漏洞说明</h2><p>{{ vulnerability.description }}</p>

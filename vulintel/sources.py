@@ -18,6 +18,7 @@ from .config import settings
 from .collector import (CollectorHTTP, CollectionError, MANIFEST_LIMIT, error_details,
                         failure_schedule, log_event)
 from .db import Source, now
+from .timeline import explicit_publication, stamp as parse_stamp
 
 CVE = re.compile(r"CVE-\d{4}-\d{4,}", re.I)
 RANK = {"unknown": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
@@ -64,7 +65,7 @@ def nvd_record(cve):
                  [r["url"] for r in cve.get("references", [])],
                  cve.get("configurations", []), severity, cvss.get("baseScore"),
                  "cisaExploitAdd" in cve, cve.get("lastModified"), cve.get("published"),
-                 cvss=cvss, status=cve.get("vulnStatus"), source_authority="NVD")
+                 cvss=cvss, status=cve.get("vulnStatus"), source_authority="NVD", exploitation_added_at=cve.get("cisaExploitAdd"))
 
 
 def ghsa_record(record):
@@ -89,7 +90,7 @@ def kev_record(record):
     return entry(record["cveID"], record.get("vulnerabilityName"), record.get("shortDescription"),
                  [record["cveID"]], [record.get("notes", "")] if record.get("notes", "").startswith("https://") else [],
                  [{"vendor": record.get("vendorProject"), "product": record.get("product")}],
-                 exploited=True, published=record.get("dateAdded"),
+                 exploited=True, kev_added_at=record.get("dateAdded"),
                  remediation=record.get("requiredAction"), ransomware=record.get("knownRansomwareCampaignUse"),
                  source_authority="CISA KEV")
 
@@ -247,10 +248,16 @@ class Upstream(CollectorHTTP):
                         severity = next((str(t.get("Description", {}).get("Value", "unknown")).lower()
                                          for t in item.get("Threats", []) if t.get("Type") == 3), "unknown")
                         severity = {"important": "high", "moderate": "medium"}.get(severity, severity)
+                        history = item.get("RevisionHistory", {})
+                        history = history.get("Revision", []) if isinstance(history, dict) else history
+                        history = history if isinstance(history, list) else [history]
+                        dates = [(parse_stamp(r.get("Date")), r.get("Date")) for r in history if isinstance(r, dict)]
+                        published = min((d for d in dates if d[0]), default=(None, None))[1]
                         yield entry(identifier, title, notes, [identifier],
                                     [f"https://msrc.microsoft.com/update-guide/vulnerability/{identifier}"],
                                     item.get("ProductStatuses", []), severity,
                                     modified=update.get("CurrentReleaseDate"),
+                                    published=published, publication_basis="微软条目最早公开修订时间",
                                     remediations=item.get("Remediations", []), source_authority="Microsoft")
         elif source.kind == "psf":
             import json
@@ -295,6 +302,8 @@ class Upstream(CollectorHTTP):
                             aliases if len(set(aliases)) == 1 else [], [link],
                             [{"product": source.config.get("product", source.name)}],
                             modified=iso(modified) if modified else None,
+                            published=iso(datetime(*raw["published_parsed"][:6])) if raw.get("published_parsed") else None,
+                            publication_basis="订阅公告公开时间",
                             mentioned_cves=sorted(set(aliases)), source_authority=source.name,
                             record_type="bulletin")
         elif source.kind == "bulletin":
@@ -318,8 +327,10 @@ class Upstream(CollectorHTTP):
                 identifiers = sorted(set(CVE.findall(description)))
                 if not identifiers:
                     continue
+                published, basis = explicit_publication(str(page), source.id, link)
                 yield entry(hashlib.sha256(link.encode()).hexdigest(), title, description, [], [link],
                             [{"product": source.config["product"]}], mentioned_cves=identifiers,
+                            published=published, publication_basis=basis,
                             source_authority=source.name, record_type="bulletin")
         else:
             raise CollectionError("unsupported_source", "来源适配器类型不受支持")
@@ -350,6 +361,14 @@ class Upstream(CollectorHTTP):
 def collect_one(source_id, force=False, upstream=None, heartbeat=None, delivery_tick=None, job_id=None):
     from .db import session
     from .service import ingest
+    from .db import MetadataState
+    def update_progress(db, **values):
+        key = "source-progress:" + source_id
+        state = db.get(MetadataState, key)
+        if state is None:
+            state = MetadataState(key=key, value={})
+            db.add(state)
+        state.value = {**state.value, **values}
     own_client = upstream is None
     started = time.monotonic()
     next_progress = started + 15
@@ -359,6 +378,7 @@ def collect_one(source_id, force=False, upstream=None, heartbeat=None, delivery_
         if source is None or (not source.enabled and not force):
             return
         source.last_attempt = cutoff
+        update_progress(db, status="running", started_at=iso(cutoff), processed=0, job_id=job_id)
         start = (source.last_success - timedelta(hours=48)) if source.last_success else cutoff - timedelta(days=7)
         # NVD limits date ranges; split long outages into <=100-day windows, advancing only fully fetched windows.
         end = min(cutoff, start + timedelta(days=100)) if source.kind == "nvd" else cutoff
@@ -381,7 +401,7 @@ def collect_one(source_id, force=False, upstream=None, heartbeat=None, delivery_
                 context = getattr(upstream, "context", {})
                 phase = context.get("phase")
                 context["phase"] = "ingest"
-                if source.kind == "kev" and date(record.get("published")) and date(record["published"]) < start:
+                if source.kind == "kev" and date(record.get("kev_added_at")) and date(record["kev_added_at"]) < start:
                     from .db import Alias, SourceRecord
                     known = db.scalar(select(SourceRecord).where(SourceRecord.source_id == source.id,
                                                                SourceRecord.source_key == record["source_key"]))
@@ -391,6 +411,9 @@ def collect_one(source_id, force=False, upstream=None, heartbeat=None, delivery_
                 ingest(db, source.id, record)
                 db.commit()
                 count += 1
+                if count % 20 == 0:
+                    update_progress(db, status="running", processed=count, heartbeat_at=iso(now()))
+                    db.commit()
                 context["phase"] = phase
                 if time.monotonic() >= next_progress:
                     progress = dict(context)
@@ -402,6 +425,7 @@ def collect_one(source_id, force=False, upstream=None, heartbeat=None, delivery_
                     delivery_tick()
             source.last_success = end
             source.error = None
+            update_progress(db, status="done", processed=count, completed_at=iso(now()))
             source.next_run = cutoff + timedelta(seconds=settings().source_interval_seconds)
             if end < cutoff:
                 source.next_run = cutoff
@@ -414,6 +438,7 @@ def collect_one(source_id, force=False, upstream=None, heartbeat=None, delivery_
         except Exception as exc:
             db.rollback()
             source = db.get(Source, source_id)
+            update_progress(db, status="failed", processed=count, failed_at=iso(now()))
             details = error_details(exc, getattr(upstream, "context", {}))
             source.next_run = failure_schedule(exc)
             source.error = (f"{details['code']} · {details['reason']}"
