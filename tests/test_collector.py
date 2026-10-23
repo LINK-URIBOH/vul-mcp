@@ -125,13 +125,18 @@ def test_forbidden_is_not_retried_and_has_one_hour_backoff(store):
         return httpx.Response(403, text="private upstream body")
     upstream = Upstream(httpx.MockTransport(handler))
     started = now()
+    previous_success = started - timedelta(days=1)
+    with store() as db:
+        db.get(Source, "cisa-advisories").last_success = previous_success
+        db.commit()
     try:
         with pytest.raises(httpx.HTTPStatusError):
             collect_one("cisa-advisories", upstream=upstream)
         assert len(calls) == 1
+        assert calls[0].headers["user-agent"] == "curl/8.0"
         with store() as db:
             row = db.get(Source, "cisa-advisories")
-            assert row.last_success is None
+            assert row.last_success == previous_success
             assert row.next_run >= started + timedelta(hours=1)
             assert "官方来源拒绝访问" in row.error
             assert "private" not in row.error

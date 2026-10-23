@@ -271,7 +271,10 @@ class Upstream(CollectorHTTP):
                     if not found:
                         raise CollectionError("invalid_psf_archive", "PSF 公告归档缺少预期记录")
         elif source.kind == "rss":
-            parsed = feedparser.parse(self.get(source.url).content)
+            # 2026-10-23: CISA returned 403 for our default UA; curl/8.0 passed two full-feed checks.
+            # Override this request only, so a reused client keeps other sources' default headers.
+            headers = {"User-Agent": "curl/8.0"} if source.id == "cisa-advisories" else {}
+            parsed = feedparser.parse(self.get(source.url, headers=headers).content)
             if not parsed.entries:
                 raise CollectionError("empty_feed", "官方订阅未包含公告条目，请核对来源或解析格式")
             for raw in parsed.entries:

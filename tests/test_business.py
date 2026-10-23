@@ -95,12 +95,12 @@ def test_cross_batch_analysis_rejected(store):
 def test_export_escaping_and_csv_formula(store):
     with store() as db:
         bid, item = prepared_batch(db)
-        item.snapshot = {**item.snapshot, "title": "=cmd|' /C test'!A0<script>alert(1)</script>"}
+        item.snapshot = {**item.snapshot, "title": "=1+1<script>alert(1)</script>"}
         db.commit()
         submit_analysis(db, "tester", bid, [analysis(item.id)])
         finalize(db, "tester", bid, "<script>alert('summary')</script>")
         assert "<script>" not in (report_dir(bid) / "report.html").read_text(encoding="utf-8")
-        assert "'=cmd" in (report_dir(bid) / "index.csv").read_text(encoding="utf-8-sig")
+        assert "'=1+1" in (report_dir(bid) / "index.csv").read_text(encoding="utf-8-sig")
 
 
 def enable_delivery(monkeypatch):

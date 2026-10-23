@@ -1,6 +1,6 @@
 name: vul-intel
 x-app: &app
-  image: vul-intel:1.0.1
+  image: vul-intel:1.0.2
   env_file: .env
   environment:
     DATABASE_URL: postgresql+psycopg://vul:${VUL_DB_PASSWORD:?run bootstrap}@db/vul
