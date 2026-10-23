@@ -62,7 +62,8 @@ def seed(rows):
             db.commit()
             if offset % 10000 == 0:
                 print(json.dumps({"seeded": offset + len(vulns), "peak_mib": memory_mib()}), flush=True)
-        db.add(MetadataState(key="publication_backfill_v2", value={"complete": True, "processed": rows}))
+        from vulintel.timeline import BACKFILL_KEY
+        db.add(MetadataState(key=BACKFILL_KEY, value={"complete": True, "processed": rows}))
         db.add(MetadataState(key="benchmark_data", value={"rows": rows, "cutoff": iso(cutoff)}))
         db.commit()
 

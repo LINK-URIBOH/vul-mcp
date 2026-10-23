@@ -11,6 +11,7 @@ from sqlalchemy import delete, select, update
 from .db import (Alias, Audit, Batch, BatchItem, Delivery, MetadataState, ReportState, Revision,
                  Source, SourceRecord, Vulnerability, now, uid)
 from .sources import RANK
+from .identity import record_aliases
 
 
 def digest(value):
@@ -23,6 +24,7 @@ def audit(db, actor, action, target):
 
 def ingest(db, source_id, data):
     """Idempotent source records; aliases link CVEs, never a bulletin's mentioned CVEs."""
+    data = {**data, "aliases": record_aliases(data)}
     source_key = data["source_key"][:240]
     record = db.scalar(select(SourceRecord).where(SourceRecord.source_id == source_id,
                                                 SourceRecord.source_key == source_key))

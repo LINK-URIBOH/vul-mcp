@@ -4,7 +4,9 @@
 
 批次状态为 preparing、analyzing、rendering、finalized、failed。仅 finalized 可下载正式文件。get_report_status 返回 policy、ready、total、analyzed、pending_analysis、new_disclosures、important_updates、unverified_dates、metadata_backfill、phase、render_stage、rendered_items、coverage_at_utc、error；准备前未知计数为 null，不是零。
 
-旧批次 policy=1、legacy=true，只读保留，不自动覆盖或重新投递。新规则 policy=2，时间段仍唯一。未完成新批次优先恢复；下一个报告不会跳过未完成分析。
+旧批次 policy=1、legacy=true，只读保留，不自动覆盖或重新投递。v1.1.0 规则为 policy=2，v1.1.1 新批次为 policy=3，时间段仍唯一。未完成新批次优先恢复；下一个报告不会跳过未完成分析。旧事件策略冻结批次增加 event_audit_required=true，升级不会自动清空或重选该批次；先使用 CLI audit-report 核对重复与公开日期。
+
+timeline.event_policy=3 区分 source_publications（来源条目公开时间与作用范围）和 published_at（有公开依据的漏洞/公告公开时间）。Debian/Ubuntu OSV 条目 published 不再直接作为漏洞公开时间；无其他日期依据时保持未知。零值日期不作为事件；changed_fields 记录真正变化字段。数据库工具、权限和九个 MCP 工具数量保持不变。
 
 ## 有界分页与证据
 

@@ -166,7 +166,7 @@ class Revision(Base):
 class ReportState(Base):
     __tablename__ = "report_states"
     batch_id: Mapped[str] = mapped_column(ForeignKey("batches.id"), primary_key=True)
-    policy: Mapped[int] = mapped_column(Integer, default=2)
+    policy: Mapped[int] = mapped_column(Integer, default=3)
     watermark: Mapped[int | None] = mapped_column(Integer)
     cursor: Mapped[int] = mapped_column(Integer, default=0)
     total: Mapped[int] = mapped_column(Integer, default=0)

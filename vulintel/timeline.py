@@ -4,9 +4,13 @@ import json
 import re
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
-from .db import MetadataState, Revision, Vulnerability, now
+from .db import MetadataState, Revision, SourceRecord, Vulnerability, now
+from .identity import publication_scope, record_aliases
+
+EVENT_POLICY = 3
+BACKFILL_KEY = "source_event_backfill_v3"
 
 
 def stamp(value):
@@ -16,7 +20,10 @@ def stamp(value):
         result = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if result.tzinfo is None:
             result = result.replace(tzinfo=timezone.utc)
-        return result.astimezone(timezone.utc).replace(tzinfo=None)
+        result = result.astimezone(timezone.utc).replace(tzinfo=None)
+        if result.year == 1:  # .NET/Go zero-time placeholders are not publication events.
+            return None
+        return result
     except (ValueError, TypeError, OverflowError):
         return None
 
@@ -65,20 +72,60 @@ def product_group(data):
     return "其他产品／待确认"
 
 
+def normalized(value):
+    if isinstance(value, dict):
+        return {key: normalized(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return sorted((normalized(child) for child in value), key=lambda child: json.dumps(child, sort_keys=True))
+    return value
+
+
+def affected_facts(values, source=""):
+    result = []
+    for value in values or []:
+        if isinstance(value, dict) and "package" in value:
+            # A distro's unbounded introduced=0 range already covers every build;
+            # enumerating another version does not change that range. Do not drop
+            # explicit versions for other ecosystems or bounded ranges (OSV union).
+            value = {key: value[key] for key in ("package", "ranges", "versions") if key in value}
+            ranges = value.get("ranges") or []
+            unbounded = any(r.get("type") == "ECOSYSTEM" and r.get("events") == [{"introduced": "0"}]
+                            for r in ranges if isinstance(r, dict))
+            if source in {"osv-debian", "osv-ubuntu"} and unbounded:
+                value.pop("versions", None)
+        result.append(value)
+    return normalized(result)
+
+
 def material(data):
     """Source additions alone do not constitute a patch or impact change."""
-    return {record.get("source", ""): {key: record.get(key) for key in
-            ("affected", "remediations", "remediation", "exploited", "withdrawn")}
-            for record in data.get("source_records", [])}
+    result = {}
+    for record in data.get("source_records", []):
+        remediations = [{key: value for key, value in remediation.items() if key != "Date"}
+                        if isinstance(remediation, dict) else remediation
+                        for remediation in record.get("remediations", [])]
+        result[(record.get("source", ""), record.get("source_key", ""))] = {
+            "affected": affected_facts(record.get("affected"), record.get("source")),
+            "remediations": normalized(remediations),
+            "remediation": record.get("remediation"), "exploited": bool(record.get("exploited")),
+            "withdrawn": bool(record.get("withdrawn"))}
+    return result
 
 
-def append_revision(db, vuln, previous=None, observed=None, baseline=False):
-    latest = db.scalar(select(Revision).where(Revision.vulnerability_id == vuln.id)
-                       .order_by(Revision.id.desc()).limit(1))
+def without_modified(value):
+    if isinstance(value, dict):
+        return {key: without_modified(child) for key, child in value.items() if key != "modified"}
+    if isinstance(value, list):
+        return [without_modified(child) for child in value]
+    return value
+
+
+def derive_revision(vuln, latest=None, previous=None, observed=None, baseline=False):
+    """Recompute derived metadata without modifying an immutable source snapshot."""
     observed = observed or now()
     data = dict(vuln.data)
     records = data.get("source_records", [data])
-    dates, updates, kev, patches = [], [], [], []
+    dates, updates, kev, patches, source_publications = [], [], [], [], []
     for record in records:
         source = record.get("source", "")
         original_public = record.get("published")
@@ -89,7 +136,11 @@ def append_revision(db, vuln, previous=None, observed=None, baseline=False):
                                                 next(iter(record.get("references", [])), ""))
             original_public = value
             public = stamp(value)
-        if public and public <= observed:
+        scope = publication_scope(record)
+        source_publications.append({"source": source, "source_key": record.get("source_key"),
+                                    "original": original_public, "published_at": iso(public), "scope": scope,
+                                    "valid": bool(public and public <= observed)})
+        if public and public <= observed and scope != "source_record":
             dates.append((public, source, basis, str(original_public), "day" if len(str(original_public)) == 10 else "datetime"))
         modified = stamp(record.get("modified"))
         if modified and modified <= observed:
@@ -110,10 +161,15 @@ def append_revision(db, vuln, previous=None, observed=None, baseline=False):
     dates.sort()
     published = dates[0][0] if dates else None
     previous = previous if previous is not None else (latest.snapshot if latest else {})
-    first_seen = latest.first_seen_at if latest else (None if baseline or previous else observed)
+    first_seen = (latest.first_seen_at if latest else
+                  stamp(data.get("timeline", {}).get("first_seen_at")) if baseline else
+                  None if previous else observed)
     old_material, new_material = material(previous), material(data)
-    changed = any(new_material[source] != old_material[source] for source in old_material.keys() & new_material.keys())
-    important = latest.important_at if latest else None
+    changed_fields = sorted({field for source in old_material.keys() & new_material.keys()
+                             for field in new_material[source] if new_material[source][field] != old_material[source][field]})
+    changed = bool(changed_fields)
+    important = (latest.important_at if latest and stamp(latest.important_at)
+                 and latest.snapshot.get("timeline", {}).get("event_policy") == EVENT_POLICY else None)
     if kev:
         important = max([*kev, *([important] if important else [])])
     if patches:
@@ -122,6 +178,7 @@ def append_revision(db, vuln, previous=None, observed=None, baseline=False):
         important = observed
     data["product_group"] = product_group(data)
     data["timeline"] = {
+        "event_policy": EVENT_POLICY, "source_publications": source_publications,
         "published_at": iso(published), "publication_source": dates[0][1] if dates else None,
         "publication_basis": dates[0][2] if dates else "未确认",
         "publication_original": dates[0][3] if dates else None,
@@ -130,13 +187,15 @@ def append_revision(db, vuln, previous=None, observed=None, baseline=False):
         "first_seen_at": iso(first_seen), "material_changed_at": iso(important),
         "kev_added_at": iso(max(kev)) if kev else None,
         "patch_published_at": iso(max(patches)) if patches else None,
+        "changed_fields": changed_fields if previous and not baseline else [],
         "change_basis": ("CISA KEV 收录时间" if kev and important == max(kev) else
                          "修复／缓解发布时间" if patches and important == max(patches) else
                          "实质变化观察时间" if important else "未确认"),
     }
     # Ignore timestamp-only changes, but preserve corrections to publication provenance.
-    comparable = {k: v for k, v in data.items() if k not in {"modified", "timeline"}}
-    comparable["publication"] = data["timeline"]["published_at"]
+    comparable = without_modified({k: v for k, v in data.items() if k != "timeline"})
+    comparable["publication"] = {key: value for key, value in data["timeline"].items()
+                                 if key not in {"upstream_updated_at", "source_publications", "changed_fields"}}
     fingerprint = hashlib.sha256(json.dumps(comparable, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     if latest and latest.content_hash == fingerprint:
         return latest
@@ -144,30 +203,93 @@ def append_revision(db, vuln, previous=None, observed=None, baseline=False):
     revision = Revision(vulnerability_id=vuln.id, observed_at=observed, first_seen_at=first_seen,
                         published_at=published, important_at=important, content_hash=fingerprint,
                         snapshot_bytes=len(encoded), snapshot=data)
-    db.add(revision)
+    return revision
+
+
+def append_revision(db, vuln, previous=None, observed=None, baseline=False):
+    latest = db.scalar(select(Revision).where(Revision.vulnerability_id == vuln.id)
+                       .order_by(Revision.id.desc()).limit(1))
+    revision = derive_revision(vuln, latest, previous, observed, baseline)
+    if revision is not latest:
+        db.add(revision)
     return revision
 
 
 def backfill_step(db, limit=100):
-    state = db.get(MetadataState, "publication_backfill_v2")
+    if db.bind.dialect.name == "postgresql":
+        from sqlalchemy import func
+        db.execute(select(func.pg_advisory_xact_lock(86221026)))
+    state = db.get(MetadataState, BACKFILL_KEY)
     if not state:
-        state = MetadataState(key="publication_backfill_v2", value={"cursor": "", "processed": 0})
+        state = MetadataState(key=BACKFILL_KEY, value={"cursor": "", "processed": 0, "phase": "aliases"})
         db.add(state)
         db.flush()
     value = dict(state.value)
     if value.get("complete"):
         return True
+    if value.get("phase") == "aliases":
+        from .service import ingest
+        ids = list(db.scalars(select(SourceRecord.id).where(SourceRecord.id > value.get("alias_cursor", ""))
+                              .order_by(SourceRecord.id).limit(limit)))
+        budget = 0
+        for identity in ids:
+            record = db.get(SourceRecord, identity)
+            budget += len(json.dumps(record.data, ensure_ascii=False).encode())
+            if record_aliases(record.data) != record.data.get("aliases", []):
+                ingest(db, record.source_id, record.data)
+                value["relinked_records"] = value.get("relinked_records", 0) + 1
+            value["alias_cursor"] = identity
+            db.flush()
+            db.expunge(record)
+            if budget >= 2_000_000:
+                break
+        if not ids:
+            value["phase"] = "events"
+        else:
+            state.value = value
+            db.flush()
+            return False
     # Select identifiers only; at most one large facts object is materialized at a time.
     ids = list(db.scalars(select(Vulnerability.id).where(Vulnerability.id > value.get("cursor", ""))
                           .order_by(Vulnerability.id).limit(limit)))
     budget = 0
     for identity in ids:
         vuln = db.get(Vulnerability, identity)
-        existing = db.scalar(select(Revision.id).where(Revision.vulnerability_id == identity).limit(1))
-        if existing is None:
+        latest = db.scalar(select(Revision).where(Revision.vulnerability_id == identity)
+                           .order_by(Revision.id.desc()).limit(1))
+        legacy = None
+        if latest is None:
             revision = append_revision(db, vuln, observed=vuln.updated_at, baseline=True)
             budget += revision.snapshot_bytes
             db.flush()
+        else:
+            budget += latest.snapshot_bytes
+            policy_column = Revision.snapshot["timeline"]["event_policy"].as_integer()
+            legacy = db.scalar(select(Revision.id).where(Revision.vulnerability_id == identity,
+                               or_(policy_column != EVENT_POLICY, policy_column.is_(None))).limit(1))
+        if latest is not None and (latest.snapshot.get("timeline", {}).get("event_policy") != EVENT_POLICY
+                                   or (legacy and not latest.snapshot.get("timeline", {}).get("history_replayed"))):
+            # Replay original facts in observation order. This preserves actual old
+            # impact changes while removing zero dates and version-enumeration noise.
+            # Only append the final corrected projection; keep all originals intact.
+            from types import SimpleNamespace
+            revision_ids = list(db.scalars(select(Revision.id).where(Revision.vulnerability_id == identity)
+                                           .order_by(Revision.observed_at, Revision.id)))
+            projection = None
+            for revision_id in revision_ids:
+                original = db.get(Revision, revision_id)
+                projection = derive_revision(SimpleNamespace(id=identity, data=original.snapshot),
+                                             projection, observed=original.observed_at, baseline=projection is None)
+                if original is not latest:
+                    db.expunge(original)
+            projection.snapshot = {**projection.snapshot, "timeline": {**projection.snapshot["timeline"],
+                                                                         "history_replayed": True}}
+            projection.snapshot_bytes = len(json.dumps(projection.snapshot, ensure_ascii=False).encode())
+            db.add(projection)
+            budget += projection.snapshot_bytes
+            db.flush()
+        if latest is not None:
+            db.expunge(latest)
         value.update(cursor=identity, processed=value.get("processed", 0) + 1)
         db.expunge(vuln)
         if budget >= 2_000_000:

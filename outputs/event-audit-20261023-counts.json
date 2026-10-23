@@ -1,0 +1,16 @@
+{
+  "batch_id": "a39a3c93-d975-4414-855c-298e380d10b1",
+  "total": 4287,
+  "marked_new": 4279,
+  "pages": 215,
+  "canonical_groups": 3418,
+  "duplicate_groups": 687,
+  "duplicate_excess": 861,
+  "distro_only_groups": 567,
+  "calendar_week_marked_dates": {
+    "in_week": 3581,
+    "before_week": 698
+  },
+  "window": "2026-10-16T18:00+08:00 / 2026-10-23T18:00+08:00",
+  "note": "Canonical ID grouping and stored timestamps only; not full evidence validation. 3418 is not a verified new-vulnerability count."
+}

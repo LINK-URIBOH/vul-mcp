@@ -13,7 +13,7 @@ from vulintel.report_jobs import item_evidence, run_report_once
 from vulintel.reports import report_dir
 from vulintel.service import Overview, batch_page, due_slot, finalize, ingest, open_batch, submit_analysis
 from vulintel.sources import entry, kev_record
-from vulintel.timeline import backfill_step, explicit_publication
+from vulintel.timeline import BACKFILL_KEY, backfill_step, explicit_publication
 
 
 @pytest.fixture
@@ -147,7 +147,7 @@ def test_metadata_backfill_checkpoints_and_known_dates(store, cutoff):
         db.commit()
         assert not backfill_step(db, limit=2)
         db.commit()
-        assert db.get(MetadataState, "publication_backfill_v2").value["processed"] == 2
+        assert db.get(MetadataState, BACKFILL_KEY).value["processed"] == 2
         while not backfill_step(db, limit=2):
             db.commit()
         db.commit()

@@ -18,6 +18,7 @@ from .config import settings
 from .collector import (CollectorHTTP, CollectionError, MANIFEST_LIMIT, error_details,
                         failure_schedule, log_event)
 from .db import Source, now
+from .identity import DISTRO_CVE_ID, record_aliases
 from .timeline import explicit_publication, stamp as parse_stamp
 
 CVE = re.compile(r"CVE-\d{4}-\d{4,}", re.I)
@@ -79,11 +80,14 @@ def ghsa_record(record):
 
 def osv_record(record):
     severity = str(record.get("database_specific", {}).get("severity", "unknown")).lower()
-    return entry(record["id"], record.get("summary"), record.get("details"),
+    value = entry(record["id"], record.get("summary"), record.get("details"),
                  [record["id"], *record.get("aliases", [])],
                  [r["url"] for r in record.get("references", [])], record.get("affected", []),
                  severity, modified=record.get("modified"), published=record.get("published"),
                  withdrawn=record.get("withdrawn"), cvss=record.get("severity", []), source_authority="OSV")
+    value["aliases"] = record_aliases(value)
+    value["publication_scope"] = "source_record" if DISTRO_CVE_ID.fullmatch(record["id"]) else "vulnerability"
+    return value
 
 
 def kev_record(record):

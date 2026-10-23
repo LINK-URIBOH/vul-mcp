@@ -10,7 +10,7 @@ from sqlalchemy.orm import aliased
 
 from .db import (Batch, BatchItem, Job, MetadataState, ReportSelection, ReportState, Revision,
                  UnverifiedItem, now, session, uid)
-from .timeline import backfill_step, iso
+from .timeline import BACKFILL_KEY, EVENT_POLICY, backfill_step, iso
 
 log = logging.getLogger("vulintel.report")
 
@@ -44,7 +44,8 @@ def enqueue(db, batch_id):
 def status(db, batch):
     state = db.get(ReportState, batch.id)
     result = {"batch_id": batch.id, "slot": batch.slot, "status": batch.status,
-              "error": batch.error, "policy": state.policy if state else 1}
+              "error": batch.error, "policy": state.policy if state else 1,
+              "event_audit_required": bool(state and state.policy < EVENT_POLICY)}
     if not state:
         total = db.scalar(select(func.count()).select_from(BatchItem).where(BatchItem.batch_id == batch.id))
         analyzed = db.scalar(select(func.count()).select_from(BatchItem).where(
@@ -54,7 +55,7 @@ def status(db, batch):
     ready = state.work.get("prepared", False)
     analyzed = db.scalar(select(func.count()).select_from(BatchItem).where(
         BatchItem.batch_id == batch.id, BatchItem.analysis.is_not(None)))
-    metadata = db.get(MetadataState, "publication_backfill_v2")
+    metadata = db.get(MetadataState, BACKFILL_KEY)
     return {**result, "ready": ready, "total": state.total if ready else None,
             "analyzed": analyzed, "pending_analysis": state.total - analyzed if ready else None,
             "new_disclosures": state.new_count, "important_updates": state.update_count,
