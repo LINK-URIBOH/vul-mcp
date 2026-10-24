@@ -27,6 +27,8 @@ def seed(db, cutoff, name, age=1, **extra):
     value = entry(name, "漏洞 " + name, extra.pop("description", "公开事实"), [name],
                   ["https://example.org/advisory"], [{"product": "示例产品"}],
                   published=(cutoff - timedelta(days=age)).isoformat() + "Z" if age is not None else None,
+                  disclosed_at=(cutoff - timedelta(days=age)).isoformat() + "Z" if age is not None else None,
+                  disclosure_reference="https://example.org/advisory",
                   **extra)
     identity = ingest(db, "nvd", value)
     db.commit()
@@ -166,11 +168,13 @@ def test_ordinary_update_is_not_important_and_later_patch_is(store, cutoff, monk
         value = entry("CVE-2026-10009", "漏洞 CVE-2026-10009", "公开事实", ["CVE-2026-10009"],
                       ["https://example.org/advisory"], [{"product": "示例产品"}],
                       published=(cutoff - timedelta(days=30)).isoformat() + "Z", modified="2026-10-23T00:00:00Z")
+        value.update(disclosed_at=value["published"], disclosure_reference="https://example.org/advisory")
         before = db.scalar(select(func.count()).select_from(Revision))
         ingest(db, "nvd", value)
         db.commit()
         assert db.scalar(select(func.count()).select_from(Revision)) == before
         value["affected"] = [{"product": "示例产品", "versions": ["1.0", "1.1"]}]
+        value["remediations"] = [{"Date": (cutoff - timedelta(days=1)).isoformat() + "Z", "Description": "Vendor Fix"}]
         ingest(db, "nvd", value)
         db.commit()
         latest = db.scalar(select(Revision).order_by(Revision.id.desc()).limit(1))
@@ -231,6 +235,8 @@ def test_subsequent_reports_skip_duplicate_disclosures_and_include_new_material_
         value = entry("CVE-2026-10100", "漏洞 CVE-2026-10100", "公开事实", ["CVE-2026-10100"],
                       ["https://example.org/advisory"], [{"product": "示例产品", "versions": ["1.0"]}],
                       published=(cutoff - timedelta(days=1)).isoformat() + "Z")
+        value.update(disclosed_at=value["published"], disclosure_reference="https://example.org/advisory",
+                     remediations=[{"Date": (third_cutoff - timedelta(seconds=1)).isoformat() + "Z", "Description": "Vendor Fix"}])
         assert ingest(db, "nvd", value) == identity
         db.commit()
         slot = (third_cutoff + timedelta(hours=8)).isoformat(timespec="minutes") + "+08:00"
@@ -243,7 +249,8 @@ def test_subsequent_reports_skip_duplicate_disclosures_and_include_new_material_
 
 def test_additive_migration_keeps_old_archives_and_is_idempotent(store):
     from vulintel import db as database
-    from vulintel.db import Migration, ReportBacklog, ReportCandidate, ReportSelection
+    from vulintel.db import (DateEvidenceCache, Migration, PublicationAnnotation, PublicationState,
+                             ReportBacklog, ReportCandidate, ReportSelection, RevisionDateProjection)
     from sqlalchemy import delete
     with store() as db:
         old = Batch(id=uid(), slot="2000-01-01T09:00+08:00", cutoff=datetime(2000, 1, 1, 1), status="finalized", summary="旧报告")
@@ -251,13 +258,14 @@ def test_additive_migration_keeps_old_archives_and_is_idempotent(store):
         db.execute(delete(Migration).where(Migration.version >= 2))
         db.commit()
     with database.engine().begin() as conn:
-        for table in [ReportCandidate, ReportBacklog, UnverifiedItem, ReportSelection, ReportState, Revision, MetadataState]:
+        for table in [ReportCandidate, ReportBacklog, UnverifiedItem, ReportSelection, ReportState,
+                      RevisionDateProjection, PublicationState, PublicationAnnotation, DateEvidenceCache, Revision, MetadataState]:
             table.__table__.drop(conn)
     database.migrate()
     database.migrate()
     with store() as db:
         assert db.get(Batch, old.id).summary == "旧报告"
-        assert db.scalar(select(func.count()).select_from(Migration)) == 3
+        assert db.scalar(select(func.count()).select_from(Migration)) == 4
 
 
 def test_historical_kev_import_does_not_become_today_update(store, cutoff):
@@ -266,7 +274,9 @@ def test_historical_kev_import_does_not_become_today_update(store, cutoff):
         ingest(db, "kev", kev_record({"cveID": "CVE-2020-10101", "dateAdded": "2020-01-01"}))
         db.commit()
         latest = db.scalar(select(Revision).where(Revision.vulnerability_id == identity).order_by(Revision.id.desc()).limit(1))
-        assert latest.important_at == datetime(2020, 1, 1)
+        assert latest.snapshot["timeline"]["kev_added_at"] == "2020-01-01"
+        assert latest.snapshot["timeline"]["important_precision"] == "day"
+        assert latest.important_at < datetime(2020, 1, 2)
         bid = open_batch(db, "test")["batch_id"]
         drain(db, bid, "analyzing")
         assert db.get(ReportState, bid).total == 0
@@ -295,7 +305,8 @@ def test_date_only_is_not_displayed_as_an_invented_time(store, cutoff):
     from vulintel.report_content import label_time
     with store() as db:
         value = (cutoff - timedelta(days=1)).date().isoformat()
-        ingest(db, "nvd", entry("CVE-2026-10103", "日期精度", "", ["CVE-2026-10103"], published=value))
+        ingest(db, "nvd", entry("CVE-2026-10103", "日期精度", "", ["CVE-2026-10103"], published=value,
+                               disclosed_at=value, disclosure_reference="https://example.org/advisory"))
         db.commit()
         data = db.scalar(select(Revision.snapshot))["timeline"]
         assert data["publication_precision"] == "day" and data["publication_original"] == value

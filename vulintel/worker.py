@@ -14,6 +14,7 @@ from .sources import collect_one
 
 log = logging.getLogger("vulintel.worker")
 stopping = False
+last_date_tick = 0.0
 
 
 def touch_heartbeat():
@@ -24,11 +25,16 @@ def touch_heartbeat():
 
 
 def tick_delivery():
+    global last_date_tick
     touch_heartbeat()
     from .report_jobs import run_report_once
     report_busy = run_report_once()
     with session() as db:
         deliver_one(db)
+    if time.monotonic() - last_date_tick >= 30:
+        from .date_enrichment import run_once
+        run_once(heartbeat=touch_heartbeat)
+        last_date_tick = time.monotonic()
     return report_busy
 
 
@@ -88,9 +94,9 @@ def main():
         lock.commit()
     with session() as db:
         for interrupted in db.scalars(select(Job).where(Job.status == "running", Job.kind != "maintenance")):
-            interrupted.status = "pending" if interrupted.kind == "report" else "failed"
+            interrupted.status = "pending" if interrupted.kind in {"report", "publication"} else "failed"
             interrupted.lease_until = None
-            interrupted.error = None if interrupted.kind == "report" else "上次工作进程中断，请重试"
+            interrupted.error = None if interrupted.kind in {"report", "publication"} else "上次工作进程中断，请重试"
             if interrupted.kind == "collect":
                 progress = db.get(MetadataState, "source-progress:" + interrupted.source_id)
                 if progress:
@@ -102,6 +108,8 @@ def main():
             try:
                 report_busy = tick_delivery()
                 busy = work_once()
+                from .date_enrichment import run_once
+                date_busy = run_once(heartbeat=touch_heartbeat)
                 if time.monotonic() - last_cleanup > 3600:
                     with session() as db:
                         db.execute(delete(LoginFlow).where(LoginFlow.expires < now()))
@@ -110,7 +118,7 @@ def main():
                     last_cleanup = time.monotonic()
                 settings().data_dir.mkdir(parents=True, exist_ok=True)
                 (settings().data_dir / "worker.heartbeat").touch()
-                if not busy and not report_busy:
+                if not busy and not report_busy and not date_busy:
                     time.sleep(5)
             except Exception as exc:
                 log_event("worker_iteration_failed", level=logging.ERROR, **error_details(exc))

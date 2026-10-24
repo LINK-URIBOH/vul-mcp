@@ -8,7 +8,7 @@ import os
 from sqlalchemy import and_, delete, or_, select, update
 
 from .config import settings
-from .db import BatchItem, Delivery, ReportBacklog, ReportSelection, Revision, UnverifiedItem, uid
+from .db import BatchItem, Delivery, PublicationAnnotation, ReportBacklog, ReportSelection, Revision, UnverifiedItem, uid
 from .report_content import (ESC, FONT, SEVERITY, article, category_label, coverage, header, markdown_article,
                              references, report_scope, scope_text)
 from .reports import csv_safe, export_item, report_dir
@@ -98,7 +98,7 @@ def render_step(db, batch, state):
     work = json.loads(json.dumps(outer.get("render", {})))
     channels = work.setdefault("channels", list(settings().delivery_channels))
     # Freeze destinations' channel set for this publication; removed channels stay paused in worker.
-    columns = csv_row(["编号", "标题", "产品", "严重性", "类别", "公开时间", "公开时间依据", "参考来源"])
+    columns = csv_row(["编号", "标题", "产品", "严重性", "类别", "公开时间", "公开时间依据", "日期状态", "日期精度", "日期原始值", "日期标注版本", "日期证据地址", "参考来源"])
     unknown_columns = csv_row(["编号", "标题", "原因", "原始修订编号", "参考来源"])
     phase = work.setdefault("phase", "details")
     if not work.get("started"):
@@ -139,19 +139,25 @@ def render_step(db, batch, state):
                             SEVERITY.get(facts.get("severity"), "未评分"),
                             category_label(facts),
                             timeline.get("published_at"), timeline.get("publication_basis"),
-                            " ".join(facts.get("references", []))])
+                            timeline.get("publication_status"), timeline.get("publication_precision"),
+                            timeline.get("publication_original"), timeline.get("date_policy"),
+                            timeline.get("publication_reference"),
+                            " ".join(sorted(set(facts.get("references", []) + facts.get("date_references", []))))])
             append(root, work, "index.csv", line)
             if "email" in channels:
                 mail_part(root, work, article(item), batch, state)
                 attachment_row(root, work, line, "index-part", columns)
             if "webhook" in channels:
                 bounded = {k: facts.get(k) for k in ["aliases", "title", "severity", "exploited", "timeline", "product_group",
-                                                   "report_category", "report_backlog", "first_eligible_at"]}
+                                                   "report_category", "report_backlog", "first_eligible_at", "date_references"]}
                 bounded["title"] = facts["title"][:500]
                 bounded["title_complete"] = len(facts["title"]) <= 500
                 bounded["aliases"] = facts.get("aliases", [])[:100]
                 bounded["aliases_complete"] = len(facts.get("aliases", [])) <= 100
-                bounded["timeline"] = {k: v for k, v in facts.get("timeline", {}).items() if k != "publication_original"}
+                bounded["timeline"] = {k: v for k, v in facts.get("timeline", {}).items() if k not in {
+                    "date_evidence", "date_conflicts", "rejected_date_evidence", "source_publications", "date_fetches", "event_dates",
+                    "cve_record_publications", "source_entry_publications"}}
+                bounded["date_evidence_complete"] = False
                 value = {"item_id": item.id, "facts": bounded, "analysis": item.analysis}
                 chunk = work.get("webhook_chunk", [])
                 encoded = len(json.dumps(value, ensure_ascii=False).encode())
@@ -197,15 +203,23 @@ def render_step(db, batch, state):
         used = 0
         for identity in identities:
             row = db.get(UnverifiedItem, identity)
-            line = csv_row([row.identifiers, row.title, "公开日期未确认", row.revision_id, " ".join(row.references)])
-            byte_count = len(line.encode("utf-8"))
+            annotation = db.get(PublicationAnnotation, row.date_annotation_id) if row.date_annotation_id else None
+            reason = {"unknown": "漏洞首次公开日期缺少足够依据", "conflict": "公开日期证据冲突", "uncertain_window": "日期精度不足以确认筛选窗口归属"}.get(row.reason, "公开日期未确认")
+            date_data = annotation.data if annotation else {}
+            gaps = sorted({item["reason"] for item in date_data.get("date_fetches", []) if item.get("reason")})
+            if gaps:
+                reason += "；补证结果：" + "、".join(gaps)
+            value = {"identifiers": row.identifiers, "title": row.title, "revision_id": row.revision_id,
+                     "references": row.references, "reason": reason, "date_annotation_id": row.date_annotation_id,
+                     "date_annotation": date_data}
+            line = csv_row([row.identifiers, row.title, reason, row.revision_id, " ".join(row.references)])
+            byte_count = len(line.encode("utf-8")) + len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
             if used and used + byte_count > 2_000_000:
                 db.expunge(row)
                 break
             append(root, work, "unverified.csv", line)
-            append(root, work, "report.html", f'<li>{ESC(row.identifiers)}：{ESC(row.title)}（公开日期未确认）' + references(row.references) + '</li>')
-            append(root, work, "report.md", f'- {ESC(row.identifiers)}：{ESC(row.title)}（公开日期未确认）\n')
-            value = {"identifiers": row.identifiers, "title": row.title, "revision_id": row.revision_id, "references": row.references}
+            append(root, work, "report.html", f'<li>{ESC(row.identifiers)}：{ESC(row.title)}（{ESC(reason)}）' + references(row.references) + '</li>')
+            append(root, work, "report.md", f'- {ESC(row.identifiers)}：{ESC(row.title)}（{ESC(reason)}）\n')
             append(root, work, "report.json", ("," if work.get("unknown_written") else "") + json.dumps(value, ensure_ascii=False))
             if "email" in channels:
                 attachment_row(root, work, line, "unverified-part", unknown_columns)

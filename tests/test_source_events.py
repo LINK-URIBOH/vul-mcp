@@ -10,11 +10,19 @@ from vulintel.db import Alias, BatchItem, MetadataState, ReportState, Revision, 
 from vulintel.event_audit import audit_items, audit_report
 from vulintel.identity import record_aliases
 from vulintel.service import ingest, open_batch
-from vulintel.sources import entry, osv_record
+from vulintel.sources import entry as raw_entry, osv_record
 from vulintel.timeline import BACKFILL_KEY, EVENT_POLICY, backfill_step, derive_revision, stamp
 
 
 OBSERVED = datetime(2026, 10, 23, 9)
+
+
+def entry(*args, **kwargs):
+    """CVE fixtures include an explicit original disclosure, independently of entry dates."""
+    if args and str(args[0]).startswith("CVE-") and kwargs.get("published"):
+        kwargs.setdefault("disclosed_at", kwargs["published"])
+        kwargs.setdefault("disclosure_reference", "https://example.org/advisory")
+    return raw_entry(*args, **kwargs)
 
 
 def distro(cve="CVE-2020-12345", prefix="DEBIAN", **extra):
@@ -86,7 +94,8 @@ def test_osv_version_enumeration_and_order_do_not_emit_important_update():
     assert projection(updated, initial).important_at is None
     updated["source_records"][0]["affected"][0]["ranges"][0]["events"].append({"fixed": "6.1.4"})
     changed = projection(updated, initial)
-    assert changed.important_at == OBSERVED
+    assert changed.important_at is None
+    assert changed.snapshot["timeline"]["change_observed_at"] == "2026-10-23T09:00:00Z"
     assert changed.snapshot["timeline"]["changed_fields"] == ["affected"]
 
 
@@ -103,7 +112,8 @@ def test_explicit_osv_versions_outside_unbounded_distro_case_are_material():
                 {"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "2"}]}], "versions": ["1"]}]}]}
     changed = copy.deepcopy(base)
     changed["source_records"][0]["affected"][0]["versions"].append("3")
-    assert projection(changed, projection(base)).important_at == OBSERVED
+    update = projection(changed, projection(base))
+    assert update.important_at is None and update.snapshot["timeline"]["changed_fields"] == ["affected"]
 
 
 def test_legacy_repair_merges_identity_without_mutating_frozen_items(store, monkeypatch):
@@ -165,7 +175,8 @@ def test_metadata_repair_replays_real_changes_and_keeps_frozen_batch(store, monk
         db.commit()
         latest = db.scalar(select(Revision).order_by(Revision.id.desc()).limit(1))
         assert latest.snapshot["timeline"]["event_policy"] == EVENT_POLICY
-        assert latest.important_at == OBSERVED + timedelta(seconds=1)
+        assert latest.important_at is None
+        assert latest.snapshot["timeline"]["change_observed_at"] == "2026-10-23T09:00:01Z"
         assert latest.first_seen_at == initial.first_seen_at
         assert initial.snapshot == before
         count = db.scalar(select(func.count()).select_from(Revision))
@@ -177,7 +188,8 @@ def test_metadata_repair_replays_real_changes_and_keeps_frozen_batch(store, monk
 
 def test_audit_groups_distro_duplicates_and_distinguishes_calendar_week():
     nvd = {"title": "公开记录", "source_key": "CVE-2026-12345", "aliases": ["CVE-2026-12345"],
-           "published": "2026-10-17T00:00:00Z", "report_category": "new"}
+           "published": "2026-10-17T00:00:00Z", "report_category": "new",
+           "disclosed_at": "2026-10-17T00:00:00Z", "disclosure_reference": "https://example.org/advisory"}
     debian = {**distro("CVE-2026-12345"), "report_category": "new"}
     result = audit_items([(1, nvd), (2, debian)], datetime(2026, 10, 23, 10))
     assert result["identity_groups"] == 1 and result["summary"]["duplicate_rows"] == 1
@@ -187,7 +199,8 @@ def test_audit_groups_distro_duplicates_and_distinguishes_calendar_week():
 
 
 def test_old_cve_id_year_is_not_used_to_guess_publication():
-    facts = {"title": "迟公开", "aliases": ["CVE-2012-20002"], "published": "2026-10-20T00:00:00Z"}
+    facts = {"title": "迟公开", "aliases": ["CVE-2012-20002"], "published": "2026-10-20T00:00:00Z",
+             "disclosed_at": "2026-10-20T00:00:00Z", "disclosure_reference": "https://example.org/advisory"}
     assert projection(facts).published_at == datetime(2026, 10, 20)
 
 

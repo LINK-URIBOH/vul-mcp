@@ -4,7 +4,7 @@
 
 批次状态为 preparing、analyzing、rendering、finalized、failed。仅 finalized 可下载正式文件。get_report_status 返回 policy、ready、total、analyzed、pending_analysis、new_disclosures、important_updates、unverified_dates、metadata_backfill、phase、render_stage、rendered_items、coverage_at_utc、error；准备前未知计数为 null，不是零。
 
-旧批次 policy=1、legacy=true，v1.1.0 为 policy=2，v1.1.1 为 policy=3，v1.2.0 新批次为 policy=4，时间段仍唯一。未完成批次优先恢复，升级本身不清理或重选旧批次；显式运行 `repair-history --clear-reports` 时清理该维护首次启动前的全部旧报告、分析、投递及归档，然后重新筛选。工具完成后再次运行不会删除新报告。旧策略仍存在时返回 event_audit_required=true。
+旧批次 policy=1、legacy=true，v1.1.0 为2，v1.1.1 为3，v1.2.0 为4，v1.3.0 为5；时间段仍唯一。旧的未发布批次拒绝沿用旧日期规则，须先运行 `repair-publication-dates --rebuild-unpublished`。该工具重置首次启动冻结的未发布批次（同一批次编号、时间段和上限），清除这些批次的分析及暂存文件，修复完成后重新准备；已归档报告不改写。完成后重跑不清理后来生成的报告。旧 `repair-history --clear-reports` 仍是清理全部报告的独立工具，不代替日期修复。
 
 v1.2.0 默认每批最多50条详细分析（REPORT_MAX_ITEMS，批次创建时冻结）。完整扫描候选后按已利用、严重性、首次待报时间及稳定编号选择；超额条目持久待报，超过七天以积压补报展示。归档成功才确认覆盖，冻结之后的新证据继续待报。未知公开日期单列，不占50条分析额度。
 
@@ -14,11 +14,17 @@ v1.2.0 默认每批最多50条详细分析（REPORT_MAX_ITEMS，批次创建时�
 
 `health_check` 新增 `maintenance`（未运行过时为null），包含阶段、任务状态、心跳及前后数量。维护状态持久保存，未完成（包括中断、失败）时拒绝报告创建、分析提交和完成，并暂停后台报告、投递及采集。通过服务器相同维护命令恢复。九个MCP工具的名称和权限不变。
 
-timeline.event_policy=3 区分 source_publications（来源条目公开时间与作用范围）和 published_at（有公开依据的漏洞/公告公开时间）。Debian/Ubuntu OSV 条目 published 不再直接作为漏洞公开时间；无其他日期依据时保持未知。零值日期不作为事件；changed_fields 记录真正变化字段。数据库工具、权限和九个 MCP 工具数量保持不变。
+v1.3.0 `timeline.event_policy=5`、`date_policy=1`。规范 `published_at` 是最早可核实公开时间；NVD/CVE记录日期与所有OSV条目日期独立保存在证据中，不能直接替代披露。`publication_status` 为 confirmed、day、unknown、conflict；后两类不计已核实新增。精确到日时 `published_at` 保持 YYYY-MM-DD，边界使用 `publication_start_at/end_at` 保守判定，不伪造小时。
+
+`get_report_status` 新增 `date_policy`、`date_coverage`、`date_audit_required`、`old_date_mixed_count`。日期覆盖包含 total、confirmed、day、unknown、conflict、missing_current_annotation、evidence_fetch_errors、pending_evidence_jobs；覆盖快照与本批入选数量不同。`health_check` 和 `get_source_status` 返回当前 `date_coverage`。维护结果另有 corrected_dates、projections_written、validated、network_gaps、checked_unpublished_batches 和重建批次的 old_date_mixed_count。零混入仅表示已检查对象版本一致，不表示所有漏洞日期已确认。
+
+完整证据包含 `date_annotation_id`、`date_assessed_at`、`publication_original/field/reference/precision`、`date_evidence`、`rejected_date_evidence`、`date_conflicts`、`cve_record_publications` 和 `source_entry_publications`。原始修订不可变；报告在截止时间内选择事实修订，再关联准备阶段冻结的日期标注编号。后来补证只校正日期，不把后来影响版本或补丁信息带入旧事实。缺少当前日期标注或历史投影时明确阻塞，不回退旧日期。
+
+`material_changed_at` 使用实际补丁、公告内容更新或已利用收录时间，`important_reference` 和 `event_dates` 保存依据；本库 `change_observed_at` 单列。日期修复不制造维护当天事件。待核实清单保留具体原因和标注证据，含日期未知、冲突及窗口边界不确定。
 
 ## 有界分页与证据
 
-get_batch_page 仍接受 batch_id、after、limit（1..20）、pending_only。返回最多约192 KB的摘要页（不含来源覆盖表）；标题/编号/关联CVE提供完整性标志，完整原文不在摘要内。analysis 为已保存分析，不能以未提供原文推断信息不存在。
+get_batch_page 仍接受 batch_id、after、limit（1..20）、pending_only。返回最多约192 KB的摘要页（不含来源覆盖表）；标题/编号/关联CVE提供完整性标志，`date_evidence_complete=false` 表示摘要未含完整日期证据，完整原文须续页读取。analysis 为已保存分析，不能以未提供原文推断信息不存在。
 
 get_item_evidence 接受 batch_id、item_id、offset（从0开始）、limit（1..16000字符）。返回 format=json-text、text、total_characters、next_offset。按顺序连接所有 text 可恢复该条目完整冻结 JSON；offset 单位为字符，不是字节。服务器核对条目与批次归属，不接受路径或 URL。
 

@@ -59,7 +59,9 @@ async def transaction(function, *args):
                      "时间段必须为北京时间 09:00 或 18:00，包含 +08:00 时区", "旧规则批次不能用新规则自动重发，请建立新的时间段报告")
             raw = str(exc) if isinstance(exc, ValueError) else ""
             from .maintenance import BLOCKED
-            known = (*known, BLOCKED)
+            from .publication import DATES_BLOCKED, DATES_MISSING
+            known = (*known, BLOCKED, DATES_BLOCKED, DATES_MISSING,
+                     "未发布批次仍使用旧日期规则，请运行 repair-publication-dates --rebuild-unpublished")
             message = raw if raw in known or re.fullmatch(r"仍有\d+条记录需要完成逐条详解", raw) else "服务端处理失败或参数无效，请核对服务日志"
             raise ToolError(f"{message[:240]}；追踪编号 {correlation}") from None
     return await asyncio.to_thread(invoke)
@@ -90,6 +92,8 @@ def make_mcp(verifier=None):
                   "server_time_utc": datetime.now(timezone.utc).isoformat(), "marker": marker}
         from .maintenance import progress
         result["maintenance"] = await transaction(progress)
+        from .publication import coverage
+        result["date_coverage"] = await transaction(coverage)
         logging.getLogger("vulintel").info(json.dumps({"event": "health_check", "result": result}))
         return result
 
@@ -97,7 +101,8 @@ def make_mcp(verifier=None):
     async def get_source_status() -> dict[str, Any]:
         """Show enabled sources, last successful collection and coverage failures."""
         principal("vul.read")
-        return {"sources": await transaction(source_status)}
+        from .publication import coverage
+        return {"sources": await transaction(source_status), "date_coverage": await transaction(coverage)}
 
     @server.tool(annotations=WRITE, structured_output=True)
     async def open_report_batch(slot: str | None = None) -> dict[str, Any]:

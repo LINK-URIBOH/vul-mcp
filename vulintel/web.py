@@ -2,7 +2,7 @@ import base64
 import hashlib
 import json
 import secrets
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -15,7 +15,8 @@ from starlette.routing import Route
 
 from .auth import token_hash
 from .config import settings
-from .db import (Alias, Audit, Batch, BatchItem, Delivery, Job, LoginFlow, ReportState, Source, Vulnerability,
+from .db import (Alias, Audit, Batch, BatchItem, Delivery, Job, LoginFlow, PublicationAnnotation, PublicationState,
+                 ReportState, Source, Vulnerability,
                  WebSession, now, session)
 from .reports import report_dir
 from .service import audit, source_status
@@ -27,7 +28,7 @@ STATUS_LABELS = {"critical": "严重", "high": "高危", "medium": "中危", "lo
                  "running": "运行中", "done": "完成", "analyzing": "分析中", "finalized": "已归档",
                  "preparing": "准备中", "rendering": "生成文件中", "staged": "待统一发布",
                  "email": "邮件", "webhook": "Webhook"}
-STATUS_LABELS.update(maintenance="历史修复", interrupted="已中断／等待恢复")
+STATUS_LABELS.update(maintenance="历史修复", publication="公开日期补证", interrupted="已中断／等待恢复")
 TEMPLATES.filters["statuslabel"] = lambda value: STATUS_LABELS.get(value, value) if isinstance(value, str) else value
 
 
@@ -130,7 +131,7 @@ async def vulnerabilities(request):
         identity = admin_session(request, db)
         if not identity:
             return RedirectResponse("/admin/login", status_code=303)
-        query = select(Vulnerability)
+        query = select(Vulnerability).outerjoin(PublicationState, PublicationState.vulnerability_id == Vulnerability.id)
         params = request.query_params
         if params.get("q"):
             term = "%" + params["q"][:200] + "%"
@@ -142,26 +143,38 @@ async def vulnerabilities(request):
             query = query.where(Vulnerability.severity == params["severity"])
         if params.get("exploited") in {"yes", "no"}:
             query = query.where(Vulnerability.exploited.is_(params["exploited"] == "yes"))
-        from .sources import date
         for key, bound in [("since", True), ("until", False)]:
             if params.get(key):
                 try:
-                    stamp = date(params[key] + "T00:00:00Z")
+                    stamp = datetime.strptime(params[key], "%Y-%m-%d") - timedelta(hours=8)
                 except ValueError:
                     raise HTTPException(400, "日期格式应为 YYYY-MM-DD") from None
-                query = query.where(Vulnerability.updated_at >= stamp) if bound else query.where(
-                    Vulnerability.updated_at < stamp + timedelta(days=1))
+                query = query.where(PublicationState.end_at >= stamp) if bound else query.where(
+                    PublicationState.start_at < stamp + timedelta(days=1))
         try:
             offset = max(0, int(params.get("offset", "0")))
         except ValueError:
             raise HTTPException(400, "无效分页") from None
-        values = list(db.scalars(query.order_by(Vulnerability.updated_at.desc()).offset(offset).limit(51)))
+        from .publication import DATE_POLICY
+        date_status = params.get("date_status")
+        if date_status:
+            if date_status not in {"confirmed", "day", "unknown", "conflict", "missing"}:
+                raise HTTPException(400, "无效日期状态")
+            query = query.where(PublicationState.annotation_id.is_(None)) if date_status == "missing" else query.where(
+                PublicationState.status == date_status, PublicationState.policy == DATE_POLICY)
+        values = list(db.scalars(query.order_by(PublicationState.start_at.desc().nullslast(),
+                                               Vulnerability.updated_at.desc()).offset(offset).limit(51)))
+        from .report_content import DATE_STATUS, label_time
+        dates = {vid: data for vid, data in db.execute(select(PublicationState.vulnerability_id, PublicationAnnotation.data)
+                 .join(PublicationAnnotation).where(PublicationState.vulnerability_id.in_([v.id for v in values])))}
         more = dict(params)
         more["offset"] = str(offset + 50)
         return page(request, identity, "漏洞索引", filters=params,
-                    columns=["编号", "标题", "严重性", "已利用", "更新时间（UTC）"],
+                    columns=["编号", "标题", "严重性", "已利用", "漏洞公开时间", "日期状态", "更新时间（UTC）"],
                     rows=[{"cells": [", ".join(v.data.get("aliases", [])), v.title, v.severity,
-                                      "是" if v.exploited else "未确认", v.updated_at],
+                                      "是" if v.exploited else "未确认",
+                                      label_time(dates.get(v.id, {}).get("published_at"), dates.get(v.id, {}).get("publication_precision")),
+                                      DATE_STATUS.get(dates.get(v.id, {}).get("publication_status"), "尚未标注"), v.updated_at],
                            "link": "/admin/vulnerabilities/" + v.id} for v in values[:50]],
                     next_url="?" + urlencode(more) if len(values) > 50 else None)
 
@@ -179,8 +192,18 @@ async def detail(request):
             .order_by(Batch.cutoff.desc()).limit(1))
         from .reports import LABELS
         narrative = [(label, latest.analysis.get(key, "未公开／未确认")) for key, label in LABELS.items()] if latest else []
+        from .publication import cached_evidence
+        state = db.get(PublicationState, record.id)
+        annotation = db.get(PublicationAnnotation, state.annotation_id) if state else None
+        date_data = annotation.data if annotation else {"publication_status": "unknown", "published_at": None}
+        _, diagnostics = cached_evidence(db, record.data)
+        from .report_content import DATE_STATUS, label_time
         return page(request, identity, record.title, vulnerability=record.data, narrative=narrative,
-                    raw_detail=json.dumps(record.data, ensure_ascii=False, indent=2))
+                    publication_time=label_time(date_data.get("published_at"), date_data.get("publication_precision")),
+                    publication_status=DATE_STATUS.get(date_data.get("publication_status"), "待核实"),
+                    date_evidence=date_data.get("date_evidence", []), publication_basis=date_data.get("publication_basis", "未确认"),
+                    raw_detail=json.dumps({"source_facts": record.data, "date_annotation": date_data,
+                                           "date_fetches": diagnostics}, ensure_ascii=False, indent=2))
 
 
 def offset_page(request):
@@ -324,9 +347,11 @@ async def action(request):
         if not secrets.compare_digest(str(form.get("csrf", "")), identity.csrf):
             raise HTTPException(403, "表单已过期，请刷新后重试")
         kind, target, operation = (request.path_params[k] for k in ("kind", "target", "operation"))
-        from .maintenance import BLOCKED, active
-        if active(db):
-            raise HTTPException(409, BLOCKED)
+        from .maintenance import report_write_guard
+        try:
+            report_write_guard(db)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
         if kind == "source":
             obj = db.get(Source, target)
             if not obj:
@@ -346,7 +371,7 @@ async def action(request):
             if not obj or obj.status != "failed":
                 raise HTTPException(409, "仅可重试失败记录，成功记录不会重发")
             if kind == "job" and obj.kind == "maintenance":
-                raise HTTPException(409, "请使用 repair-history --clear-reports 恢复维护任务")
+                raise HTTPException(409, "请使用任务记录显示的服务器修复命令恢复维护任务")
             obj.status, obj.error, obj.lease_until = "pending", None, None
             if kind == "delivery":
                 obj.attempts, obj.next_run = 0, now()

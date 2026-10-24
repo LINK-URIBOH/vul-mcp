@@ -17,6 +17,8 @@ def main():
     repair = commands.add_parser("repair-history", help="持续修复全部历史数据，清理旧报告；中断后同命令恢复")
     repair.add_argument("--clear-reports", action="store_true", required=True,
                         help="清理首次运行时已有的全部报告、分析、投递队列与归档文件")
+    dates = commands.add_parser("repair-publication-dates", help="补证、重标全部历史公开日期并重建未发布批次")
+    dates.add_argument("--rebuild-unpublished", action="store_true", required=True)
     review = commands.add_parser("audit-report", help="只读审计冻结批次的公开事件与重复标识，不重建或投递")
     review.add_argument("batch_id")
     review.add_argument("--snapshot-json", help="离线审计 get_batch_page 摘要导出；不连接数据库，不代替完整证据核查")
@@ -46,9 +48,11 @@ def main():
             print(json.dumps(audit_report(db, args.batch_id), ensure_ascii=False, indent=2))
         return
     initialize()
-    if args.command == "repair-history":
+    if args.command in {"repair-history", "repair-publication-dates"}:
         import signal
         from .maintenance import run_repair
+        if args.command == "repair-publication-dates":
+            from .date_repair import run_repair
         def stopped(*_):
             raise KeyboardInterrupt
         signal.signal(signal.SIGTERM, stopped)
@@ -75,9 +79,11 @@ def main():
             from .report_jobs import status as report_status
             from .timeline import BACKFILL_KEY
             from .maintenance import progress
+            from .publication import coverage
             metadata = db.get(MetadataState, BACKFILL_KEY)
             print(json.dumps({"sources": source_status(db),
                               "maintenance": progress(db),
+                              "date_coverage": coverage(db),
                               "metadata_backfill": metadata.value if metadata else {"complete": False},
                               "reports": [report_status(db, batch) for batch in db.scalars(
                                   select(Batch).order_by(Batch.cutoff.desc()).limit(10))]}, ensure_ascii=False, indent=2))
@@ -103,7 +109,9 @@ def main():
             if not record or record.status != "failed":
                 raise SystemExit("仅可重试失败记录")
             if args.kind == "job" and record.kind == "maintenance":
-                raise SystemExit("请使用 repair-history --clear-reports 恢复维护任务")
+                from .publication import REPAIR_KEY
+                command = "repair-publication-dates --rebuild-unpublished" if record.source_id == REPAIR_KEY else "repair-history --clear-reports"
+                raise SystemExit("请使用 " + command + " 恢复维护任务")
             record.status, record.error, record.lease_until = "pending", None, None
             if args.kind == "delivery":
                 record.attempts, record.next_run = 0, now()

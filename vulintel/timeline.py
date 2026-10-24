@@ -9,8 +9,8 @@ from sqlalchemy import or_, select
 from .db import MetadataState, Revision, SourceRecord, Vulnerability, now
 from .identity import publication_scope, record_aliases
 
-EVENT_POLICY = 4
-BACKFILL_KEY = "source_event_backfill_v4"
+EVENT_POLICY = 5
+BACKFILL_KEY = "source_event_backfill_v4"  # Legacy identity-repair checkpoint, not publication annotation readiness.
 
 
 def stamp(value):
@@ -125,9 +125,12 @@ def derive_revision(vuln, latest=None, previous=None, observed=None, baseline=Fa
     observed = observed or now()
     data = dict(vuln.data)
     records = data.get("source_records", [data])
-    dates, updates, kev, patches, source_publications = [], [], [], [], []
+    from .publication import RSS_SOURCES, date_interval, https_url, resolve_publication
+    publication = resolve_publication(data, assessed=observed)
+    updates, events, source_publications = [], [], []
     for record in records:
         source = record.get("source", "")
+        reference = next((url for url in record.get("references", []) if https_url(url)), None)
         original_public = record.get("published")
         public = stamp(original_public) if source != "kev" else None
         basis = record.get("publication_basis", "上游公开时间")
@@ -140,26 +143,20 @@ def derive_revision(vuln, latest=None, previous=None, observed=None, baseline=Fa
         source_publications.append({"source": source, "source_key": record.get("source_key"),
                                     "original": original_public, "published_at": iso(public), "scope": scope,
                                     "valid": bool(public and public <= observed)})
-        if public and public <= observed and scope != "source_record":
-            dates.append((public, source, basis, str(original_public), "day" if len(str(original_public)) == 10 else "datetime"))
         modified = stamp(record.get("modified"))
         if modified and modified <= observed:
             updates.append(modified)
-        if source == "kev":
-            added = stamp(record.get("kev_added_at") or record.get("published"))
-            if added and added <= observed:
-                kev.append(added)
-        elif source == "nvd":
-            added = stamp(record.get("exploitation_added_at"))
-            if added and added <= observed:
-                kev.append(added)
+        added = record.get("kev_added_at") if source == "kev" else record.get("exploitation_added_at") if source == "nvd" else None
+        if added:
+            events.append((added, None, "CISA KEV 收录时间", source,
+                           "https://www.cisa.gov/known-exploited-vulnerabilities-catalog", "dateAdded"))
         for remediation in record.get("remediations", []):
             if isinstance(remediation, dict):
-                released = stamp(remediation.get("Date"))
-                if released and released <= observed:
-                    patches.append(released)
-    dates.sort()
-    published = dates[0][0] if dates else None
+                url = remediation.get("URL") if https_url(remediation.get("URL")) else reference
+                if remediation.get("Date") and url:
+                    events.append((remediation["Date"], "UTC" if source == "msrc" else None,
+                                   "修复／缓解发布时间", source, url, "remediations.Date"))
+    published = stamp(publication.get("publication_start_at"))
     previous = previous if previous is not None else (latest.snapshot if latest else {})
     first_seen = (latest.first_seen_at if latest else
                   stamp(data.get("timeline", {}).get("first_seen_at")) if baseline else
@@ -170,32 +167,61 @@ def derive_revision(vuln, latest=None, previous=None, observed=None, baseline=Fa
     changed = bool(changed_fields)
     important = (latest.important_at if latest and stamp(latest.important_at)
                  and latest.snapshot.get("timeline", {}).get("event_policy") == EVENT_POLICY else None)
-    if kev:
-        important = max([*kev, *([important] if important else [])])
-    if patches:
-        important = max([*patches, *([important] if important else [])])
-    if previous and not baseline and (changed or (data.get("exploited") and not previous.get("exploited") and not kev)):
-        important = observed
+    old_timeline = latest.snapshot.get("timeline", {}) if latest else {}
+    event_value = old_timeline.get("material_changed_at") if important else None
+    event_end = old_timeline.get("important_end_at") if important else None
+    event_precision = old_timeline.get("important_precision") if important else None
+    event_basis = old_timeline.get("change_basis", "未确认") if important else "未确认"
+    event_reference = old_timeline.get("important_reference") if important else None
+    event_dates = []
+    kev_value, patch_value = None, None
+    observation = old_timeline.get("change_observed_at")
+    if previous and not baseline and changed:
+        observation = iso(observed)
+        # A local comparison proves observation, not when a patch/disclosure
+        # happened. Only dated publisher updates supply a reportable event.
+        for record in records:
+            key = (record.get("source", ""), record.get("source_key", ""))
+            source = key[0]
+            if (key in old_material and key in new_material and old_material[key] != new_material[key]
+                    and source in {"ghsa", "msrc", "apple", "android", "nodejs", "go-blog", "php", "debian", "ubuntu", "cisco", "fortinet"}
+                    and (source not in RSS_SOURCES or record.get("feed_updated_original"))
+                    and any(https_url(url) for url in record.get("references", [])) and record.get("modified")):
+                reference = next(url for url in record["references"] if https_url(url))
+                events.append((record["modified"], "UTC" if source in {"msrc", "ghsa"} else None,
+                               "公告重要内容更新时间", source, reference, "modified"))
+    for raw, zone, event_reason, source, reference, field in events:
+        bounds = date_interval(raw, zone)
+        if not bounds or bounds[0] > observed:
+            continue
+        begin, end, precision = bounds
+        event_dates.append({"source": source, "field": field, "original": raw, "timezone": zone,
+                            "precision": precision, "start_at": iso(begin), "end_at": iso(min(end, observed)),
+                            "basis": event_reason, "url": reference})
+        if event_reason == "CISA KEV 收录时间":
+            kev_value = raw
+        elif event_reason == "修复／缓解发布时间":
+            patch_value = raw
+        if important is None or begin >= important:
+            important, event_value, event_end = begin, raw if precision == "day" else iso(begin), iso(min(end, observed))
+            event_precision, event_basis = precision, event_reason
+            event_reference = reference
     data["product_group"] = product_group(data)
     data["timeline"] = {
-        "event_policy": EVENT_POLICY, "source_publications": source_publications,
-        "published_at": iso(published), "publication_source": dates[0][1] if dates else None,
-        "publication_basis": dates[0][2] if dates else "未确认",
-        "publication_original": dates[0][3] if dates else None,
-        "publication_precision": dates[0][4] if dates else None,
+        **publication, "event_policy": EVENT_POLICY, "source_publications": source_publications,
         "upstream_updated_at": iso(max(updates)) if updates else None,
-        "first_seen_at": iso(first_seen), "material_changed_at": iso(important),
-        "kev_added_at": iso(max(kev)) if kev else None,
-        "patch_published_at": iso(max(patches)) if patches else None,
+        "first_seen_at": iso(first_seen), "material_changed_at": event_value,
+        "important_end_at": event_end, "important_precision": event_precision,
+        "important_reference": event_reference, "event_dates": event_dates,
+        "change_observed_at": observation,
+        "kev_added_at": kev_value, "patch_published_at": patch_value,
         "changed_fields": changed_fields if previous and not baseline else [],
-        "change_basis": ("CISA KEV 收录时间" if kev and important == max(kev) else
-                         "修复／缓解发布时间" if patches and important == max(patches) else
-                         "实质变化观察时间" if important else "未确认"),
+        "change_basis": event_basis,
     }
     # Ignore timestamp-only changes, but preserve corrections to publication provenance.
     comparable = without_modified({k: v for k, v in data.items() if k != "timeline"})
     comparable["publication"] = {key: value for key, value in data["timeline"].items()
-                                 if key not in {"upstream_updated_at", "source_publications", "changed_fields"}}
+                                 if key not in {"upstream_updated_at", "source_publications", "changed_fields", "change_observed_at"}}
     fingerprint = hashlib.sha256(json.dumps(comparable, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     if latest and latest.content_hash == fingerprint:
         return latest
@@ -338,8 +364,4 @@ def explicit_publication(page, source_id, url):
             return datetime.strptime(match[1], "%B %d, %Y").date().isoformat(), "厂商标注的公开日期"
         except ValueError:
             pass
-    if source_id == "android":
-        candidate = url.rsplit("/", 1)[-1]
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", candidate) and stamp(candidate):
-            return candidate, "Android 公告日期"
     return None, "未确认"

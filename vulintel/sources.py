@@ -18,7 +18,7 @@ from .config import settings
 from .collector import (CollectorHTTP, CollectionError, MANIFEST_LIMIT, error_details,
                         failure_schedule, log_event)
 from .db import Source, now
-from .identity import DISTRO_CVE_ID, record_aliases
+from .identity import record_aliases
 from .timeline import explicit_publication, stamp as parse_stamp
 
 CVE = re.compile(r"CVE-\d{4}-\d{4,}", re.I)
@@ -86,7 +86,7 @@ def osv_record(record):
                  severity, modified=record.get("modified"), published=record.get("published"),
                  withdrawn=record.get("withdrawn"), cvss=record.get("severity", []), source_authority="OSV")
     value["aliases"] = record_aliases(value)
-    value["publication_scope"] = "source_record" if DISTRO_CVE_ID.fullmatch(record["id"]) else "vulnerability"
+    value["publication_scope"] = "source_record"
     return value
 
 
@@ -255,13 +255,17 @@ class Upstream(CollectorHTTP):
                         history = item.get("RevisionHistory", {})
                         history = history.get("Revision", []) if isinstance(history, dict) else history
                         history = history if isinstance(history, list) else [history]
-                        dates = [(parse_stamp(r.get("Date")), r.get("Date")) for r in history if isinstance(r, dict)]
+                        dates = [(parse_stamp(r.get("Date")), r.get("Date")) for r in history if isinstance(r, dict)
+                                 and re.search(r"information published|initial (?:public|release)|first (?:public|release)",
+                                               str(r.get("Description", "")), re.I)]
                         published = min((d for d in dates if d[0]), default=(None, None))[1]
                         yield entry(identifier, title, notes, [identifier],
                                     [f"https://msrc.microsoft.com/update-guide/vulnerability/{identifier}"],
                                     item.get("ProductStatuses", []), severity,
                                     modified=update.get("CurrentReleaseDate"),
-                                    published=published, publication_basis="微软条目最早公开修订时间",
+                                    published=published, publication_basis="微软条目明确首次公开修订",
+                                    publication_kind="initial_disclosure", publication_timezone="UTC",
+                                    revision_history=history,
                                     remediations=item.get("Remediations", []), source_authority="Microsoft")
         elif source.kind == "psf":
             import json
@@ -302,11 +306,14 @@ class Upstream(CollectorHTTP):
                 aliases = CVE.findall(title + " " + description)
                 # Feeds grouping several CVEs are bulletins, not claims that those CVEs are aliases.
                 key = raw.get("id") or link
+                original_updated = raw["updated"] if "updated" in raw else None
                 yield entry(hashlib.sha256(key.encode()).hexdigest(), title, description,
                             aliases if len(set(aliases)) == 1 else [], [link],
                             [{"product": source.config.get("product", source.name)}],
-                            modified=iso(modified) if modified else None,
-                            published=iso(datetime(*raw["published_parsed"][:6])) if raw.get("published_parsed") else None,
+                            modified=(original_updated if original_updated and re.fullmatch(r"\d{4}-\d{2}-\d{2}", original_updated)
+                                      else iso(modified) if modified and original_updated else None),
+                            published=raw.get("published"),
+                            feed_published_original=raw.get("published"), feed_updated_original=original_updated,
                             publication_basis="订阅公告公开时间",
                             mentioned_cves=sorted(set(aliases)), source_authority=source.name,
                             record_type="bulletin")

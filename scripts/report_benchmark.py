@@ -13,12 +13,14 @@ from sqlalchemy.engine import make_url
 
 from vulintel import __version__
 from vulintel.config import settings
-from vulintel.db import (Batch, BatchItem, Delivery, MetadataState, Revision, Vulnerability,
+from vulintel.db import (Batch, BatchItem, Delivery, MetadataState, PublicationAnnotation, PublicationState,
+                         Revision, RevisionDateProjection, Vulnerability,
                          migrate, now, session, uid)
+from vulintel.publication import DATE_POLICY, proof, resolve_publication
 from vulintel.report_jobs import run_report_once, status
 from vulintel.reports import report_dir
-from vulintel.service import Analysis, due_slot, finalize, open_batch
-from vulintel.timeline import iso
+from vulintel.service import Analysis, digest, due_slot, finalize, open_batch
+from vulintel.timeline import EVENT_POLICY, iso
 
 
 def memory_mib():
@@ -35,7 +37,7 @@ def seed(rows):
         if db.scalar(select(func.count()).select_from(Vulnerability)):
             raise ValueError("基准数据库必须为空；已有测试数据请使用 --run-only")
         for offset in range(0, rows, 500):
-            vulns, revisions = [], []
+            vulns, revisions, annotations = [], [], []
             for number in range(offset, min(rows, offset + 500)):
                 category = "new" if number < 20 else "update" if number < 30 else "unknown" if number < 40 else "old"
                 published = cutoff - timedelta(days=1 if category == "new" else 90)
@@ -50,6 +52,14 @@ def seed(rows):
                          "product_group": "合成测试系统", "timeline": {"published_at": iso(published),
                          "publication_source": "synthetic", "publication_basis": "合成测试时间",
                          "material_changed_at": iso(important)}}
+                canonical = resolve_publication({}, [proof("synthetic", identity, "disclosed_at", iso(published),
+                    "disclosure", "https://example.org/synthetic-advisory")] if published else [], assessed=cutoff)
+                facts["timeline"] = {**facts["timeline"], **canonical, "event_policy": EVENT_POLICY,
+                                     "important_end_at": iso(important), "important_precision": "datetime" if important else None,
+                                     "important_reference": "https://example.org/synthetic-advisory" if important else None}
+                annotations.append({"vulnerability_id": identity, "policy": DATE_POLICY, "assessed_at": cutoff,
+                                    "status": canonical["publication_status"], "start_at": published, "end_at": published,
+                                    "fingerprint": digest(canonical), "data": canonical})
                 vulns.append({"id": identity, "data": facts, "title": facts["title"], "product": "合成测试系统",
                               "severity": facts["severity"], "exploited": facts["exploited"],
                               "updated_at": cutoff - timedelta(seconds=1)})
@@ -58,7 +68,16 @@ def seed(rows):
                                   "observed_at": cutoff - timedelta(seconds=1), "first_seen_at": cutoff - timedelta(seconds=1),
                                   "published_at": published, "important_at": important, "content_hash": str(number)})
             db.execute(Vulnerability.__table__.insert(), vulns)
-            db.execute(Revision.__table__.insert(), revisions)
+            revision_ids = dict(db.execute(Revision.__table__.insert().returning(
+                Revision.vulnerability_id, Revision.id), revisions).all())
+            annotation_ids = dict(db.execute(PublicationAnnotation.__table__.insert().returning(
+                PublicationAnnotation.vulnerability_id, PublicationAnnotation.id), annotations).all())
+            db.execute(PublicationState.__table__.insert(), [{"vulnerability_id": row["vulnerability_id"],
+                "annotation_id": annotation_ids[row["vulnerability_id"]], "policy": DATE_POLICY,
+                "status": row["status"], "start_at": row["start_at"], "end_at": row["end_at"]} for row in annotations])
+            db.execute(RevisionDateProjection.__table__.insert(), [{"revision_id": revision_ids[row["vulnerability_id"]],
+                "policy": EVENT_POLICY, "important_at": row["important_at"], "important_end_at": row["important_at"],
+                "timeline": row["snapshot"]["timeline"]} for row in revisions])
             db.commit()
             if offset % 10000 == 0:
                 print(json.dumps({"seeded": offset + len(vulns), "peak_mib": memory_mib()}), flush=True)

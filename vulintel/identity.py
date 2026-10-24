@@ -22,7 +22,12 @@ def record_aliases(data):
 
 def publication_scope(record):
     # Infer for historical payloads too; a new distro entry is not a new CVE.
-    if (record.get("source") in {"osv-debian", "osv-ubuntu"}
+    source = record.get("source", "")
+    if (source.startswith("osv-") or record.get("source_authority") == "OSV"
             or DISTRO_CVE_ID.fullmatch(str(record.get("source_key", "")))):
         return "source_record"
-    return record.get("publication_scope", "vulnerability")
+    if source == "nvd":
+        return "record_publication"
+    if source == "kev":
+        return "kev_added"
+    return record.get("publication_scope", "unknown")

@@ -1,6 +1,6 @@
 # 漏洞情报正式版
 
-当前版本 **v1.2.0**：提供启动一次持续完成的历史修复工具，可清理全部旧报告；每批默认最多50条详细分析，超额记录持久待报并支持跨七天补报。修复过程不会把维护操作标成当天漏洞变化。部署与 `screen` 运行方式见 [v1.2.0 升级说明](UPGRADE_v1.2.0.md)，接口见 [报告接口说明](REPORT_API.md)。继续支持仅 SMTP、仅 HTTPS Webhook 或双渠道，以及来源事件标记修复。
+当前版本 **v1.3.0**：以最早可核实公开时间筛选漏洞，分开保存数据库条目日期、补丁和已利用事件日期。提供带缓存、限速及恢复能力的官方日期补证和全量历史重标工具；重建未发布批次，保留已归档报告。每批默认最多50条，超额持久待报。部署与 `screen` 用法见 [v1.3.0 升级说明](UPGRADE_v1.3.0.md)，接口见 [报告接口说明](REPORT_API.md)。
 
 独立于 `vul-mcp-check` 交付。本目录不包含生产密码、令牌、收件地址或 Webhook 目标。
 Codex 云端执行分析；Debian 服务采集、去重、归档与投递。不需要额外模型 API，也不要求个人电脑开机。
@@ -50,7 +50,7 @@ curl --fail http://127.0.0.1:8001/healthz
 `bootstrap.py` 拒绝覆盖已有 realm 文件。Keycloak 已有数据库时不会重新导入 realm，因此修改导入 JSON 不是更新线上配置的方式。后续通过受控 Keycloak 管理入口或管理 CLI 修改。
 默认 Keycloak 管理员 `bootstrap-admin` 是初始化账号，请按 Keycloak 的流程建立持久管理账号并移除临时账号；业务网页登录使用单独的 `ADMIN_USERNAME`，两者职责不同。
 
-业务数据库编号迁移在启动时执行并记录到 `schema_migrations`；当前为003（新增持久待报队列）。升级本身保留旧报告和投递记录；显式运行 `bash scripts/repair_history.sh` 才清理首次运行时已有报告并持续修复全部历史数据，中断后同命令恢复。不要手工调用 `create_all` 代替迁移。
+业务数据库编号迁移在启动时执行并记录到 `schema_migrations`；当前为004（公开日期标注、历史修订日期投影及补证缓存）。升级后运行 `bash scripts/repair_publication_dates.sh` 重标全部历史漏洞并重建未发布批次；中断后同命令恢复。旧的 `repair_history.sh` 会清理全部报告，不用于本版日期修复。不要手工调用 `create_all` 代替迁移。
 
 ## 2. Nginx 和 Cloudflare
 

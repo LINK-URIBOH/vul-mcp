@@ -30,6 +30,8 @@ def ingest(db, source_id, data, *, maintenance=False):
                                                 SourceRecord.source_key == source_key))
     fingerprint = digest({k: v for k, v in data.items() if k not in {"modified"}})
     if record and record.fingerprint == fingerprint and not maintenance:
+        from .publication import annotate
+        annotate(db, db.get(Vulnerability, record.vulnerability_id))
         return record.vulnerability_id
     aliases = sorted(set([str(a).upper() for a in data.get("aliases", [])] or [f"{source_id}:{source_key}".upper()]))
     ids = list(db.scalars(select(Alias.vulnerability_id).where(Alias.alias.in_(aliases)).distinct()))
@@ -40,6 +42,12 @@ def ingest(db, source_id, data, *, maintenance=False):
         vuln = db.get(Vulnerability, ids[0])
         # Late alias bridging can merge previously separate source entities.
         for other in ids[1:]:
+            from .db import PublicationAnnotation, PublicationState
+            db.execute(update(PublicationAnnotation).where(PublicationAnnotation.vulnerability_id == other)
+                       .values(vulnerability_id=vuln.id))
+            db.execute(delete(PublicationState).where(PublicationState.vulnerability_id == other))
+            from .db import Job
+            db.execute(delete(Job).where(Job.kind == "publication", Job.source_id == other))
             pending = db.get(ReportBacklog, other)
             if pending:
                 current = db.get(ReportBacklog, vuln.id)
@@ -90,6 +98,10 @@ def ingest(db, source_id, data, *, maintenance=False):
         vuln.updated_at = now()
         from .timeline import append_revision
         revision = append_revision(db, vuln, previous=previous)
+        db.flush()
+        from .publication import annotate, project_revision
+        annotate(db, vuln, assessed=revision.observed_at)
+        project_revision(db, revision, derived=revision)
         pending = db.get(ReportBacklog, vuln.id)
         if pending:
             db.flush()

@@ -8,9 +8,11 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import Text, cast, delete, exists, func, or_, select
 from sqlalchemy.orm import aliased
 
-from .db import (Batch, BatchItem, Job, MetadataState, ReportBacklog, ReportCandidate, ReportSelection, ReportState, Revision,
+from .db import (Batch, BatchItem, Job, MetadataState, PublicationAnnotation, ReportBacklog, ReportCandidate,
+                 ReportSelection, ReportState, Revision, RevisionDateProjection,
                  UnverifiedItem, now, session, uid)
-from .timeline import BACKFILL_KEY, EVENT_POLICY, backfill_step, iso
+from .timeline import BACKFILL_KEY, EVENT_POLICY, iso
+from .publication import (DATE_POLICY, DATES_MISSING, VERIFIED, corrected_snapshot, coverage, date_in_window)
 
 log = logging.getLogger("vulintel.report")
 
@@ -22,6 +24,8 @@ def failure_reason(exc):
         "报告暂存文件缺失或短于检查点，请从备份恢复或重新准备该批次",
         "报告暂存文件短于检查点，禁止发布", "发布文件缺失或校验失败",
         "报告条目计数不一致，禁止发布", "日期待核实计数不一致，禁止发布",
+        DATES_MISSING,
+        "未发布批次仍使用旧日期规则，请运行 repair-publication-dates --rebuild-unpublished",
     }
     raw = str(exc) if isinstance(exc, ValueError) else ""
     if raw in allowed:
@@ -43,9 +47,16 @@ def enqueue(db, batch_id):
 
 def status(db, batch):
     state = db.get(ReportState, batch.id)
+    wrong_date = db.scalar(select(func.count()).select_from(BatchItem).where(BatchItem.batch_id == batch.id,
+        or_(BatchItem.snapshot["timeline"]["date_policy"].as_integer().is_(None),
+            BatchItem.snapshot["timeline"]["date_policy"].as_integer() != DATE_POLICY,
+            BatchItem.snapshot["timeline"]["event_policy"].as_integer().is_(None),
+            BatchItem.snapshot["timeline"]["event_policy"].as_integer() != EVENT_POLICY)))
     result = {"batch_id": batch.id, "slot": batch.slot, "status": batch.status,
               "error": batch.error, "policy": state.policy if state else 1,
-              "event_audit_required": bool(state and state.policy < EVENT_POLICY)}
+              "event_audit_required": bool(state and state.policy < EVENT_POLICY),
+              "date_policy": DATE_POLICY, "old_date_mixed_count": wrong_date,
+              "date_audit_required": bool(wrong_date or state and state.work.get("date_policy") != DATE_POLICY)}
     if not state:
         total = db.scalar(select(func.count()).select_from(BatchItem).where(BatchItem.batch_id == batch.id))
         analyzed = db.scalar(select(func.count()).select_from(BatchItem).where(
@@ -67,6 +78,7 @@ def status(db, batch):
             "deferred_count": state.work.get("deferred_count"), "backlog_selected": state.work.get("backlog_selected", 0),
             "current_new_disclosures": state.new_count - state.work.get("backlog_new", 0),
             "recent_important_updates": state.update_count - state.work.get("backlog_updates", 0),
+            "date_coverage": state.work.get("date_coverage"),
             "retry_after_seconds": 30 if batch.status in {"preparing", "rendering"} else None,
             "metadata_backfill": metadata.value if metadata else {"complete": False}}
 
@@ -92,6 +104,8 @@ def open_batch(db, actor, slot=None):
     batch = pending or db.scalar(select(Batch).where(Batch.slot == slot))
     if batch:
         state = db.get(ReportState, batch.id)
+        if state and batch.status != "finalized" and state.policy < EVENT_POLICY:
+            raise ValueError("未发布批次仍使用旧日期规则，请运行 repair-publication-dates --rebuild-unpublished")
         if state and batch.status == "failed":
             batch.status = "analyzing" if state.work.get("prepared") else "preparing"
             if state.work.get("phase") not in {"prepare", "select", "analyzing"}:
@@ -109,7 +123,7 @@ def open_batch(db, actor, slot=None):
     db.add(batch)
     db.flush()
     db.add(ReportState(batch_id=batch.id, work={"phase": "prepare", "prepared": False,
-                                              "item_limit": settings().report_max_items}))
+                                              "item_limit": settings().report_max_items, "date_policy": DATE_POLICY}))
     enqueue(db, batch.id)
     audit(db, actor, "batch.create", batch.id)
     db.commit()
@@ -120,57 +134,75 @@ def prepare_step(db, batch, state):
     if state.work.get("phase") == "select":
         select_step(db, batch, state)
         return
-    if not backfill_step(db):
-        return
     if state.watermark is None:
         state.watermark = db.scalar(select(func.max(Revision.id))) or 0
+        state.work = {**state.work, "date_watermark": db.scalar(select(func.max(PublicationAnnotation.id))) or 0,
+                      "date_coverage": coverage(db)}
     other = aliased(Revision)
+    later_annotation = aliased(PublicationAnnotation)
     start = batch.cutoff - timedelta(days=7)
     later = exists(select(other.id).where(other.vulnerability_id == Revision.vulnerability_id,
                    other.id > Revision.id, other.id <= state.watermark, other.observed_at <= batch.cutoff))
-    queued = exists(select(ReportBacklog.vulnerability_id).where(
-        ReportBacklog.vulnerability_id == Revision.vulnerability_id))
-    recent = or_(Revision.published_at.between(start, batch.cutoff),
-                 Revision.important_at.between(start, batch.cutoff), Revision.published_at.is_(None), queued)
-    candidates = list(db.execute(select(Revision.id, Revision.snapshot_bytes).where(
+    annotation_newer = exists(select(later_annotation.id).where(
+        later_annotation.vulnerability_id == PublicationAnnotation.vulnerability_id,
+        later_annotation.id > PublicationAnnotation.id, later_annotation.id <= state.work["date_watermark"],
+        later_annotation.policy == DATE_POLICY))
+    query = select(Revision.id, Revision.snapshot_bytes, PublicationAnnotation.id).outerjoin(
+        PublicationAnnotation, (PublicationAnnotation.vulnerability_id == Revision.vulnerability_id)
+        & (PublicationAnnotation.id <= state.work["date_watermark"]) & (PublicationAnnotation.policy == DATE_POLICY)
+        & ~annotation_newer).where(
         Revision.id > state.cursor, Revision.id <= state.watermark, Revision.observed_at <= batch.cutoff,
-        recent, ~later).order_by(Revision.id).limit(100)))
+        ~later).order_by(Revision.id).limit(100)
+    candidates = list(db.execute(query))
     used = 0
-    for identity, byte_count in candidates:
+    for identity, byte_count, annotation_id in candidates:
         if used and used + byte_count > 2_000_000:
             break
         revision = db.get(Revision, identity)
+        annotation = db.get(PublicationAnnotation, annotation_id) if annotation_id else None
+        projection = db.get(RevisionDateProjection, identity)
+        facts = corrected_snapshot(revision, projection, annotation)
         prior = db.execute(select(ReportSelection, BatchItem).join(BatchItem).join(Batch)
                            .join(Revision, Revision.id == ReportSelection.revision_id)
                            .where(Revision.vulnerability_id == revision.vulnerability_id,
                                   Batch.status == "finalized")
                            .order_by(Batch.cutoff.desc()).limit(1)).first()
         old = db.get(Revision, prior[0].revision_id) if prior else None
-        new = revision.published_at and start <= revision.published_at <= batch.cutoff and not prior
-        important = (revision.important_at and start <= revision.important_at <= batch.cutoff
-                     and (not old or not old.important_at or revision.important_at > old.important_at))
+        old_projection = db.get(RevisionDateProjection, old.id) if old else None
+        new = date_in_window(annotation, start, batch.cutoff) and not prior
+        important = (projection.important_at and start <= projection.important_at <= batch.cutoff
+                     and projection.important_end_at is not None and projection.important_end_at <= batch.cutoff
+                     and (not old_projection or not old_projection.important_at
+                          or projection.important_at > old_projection.important_at))
         backlog = db.get(ReportBacklog, revision.vulnerability_id)
         # Later authoritative evidence can invalidate an earlier "new" date.
         # Persistence is for qualified overflow, not for preserving a disproved
         # disclosure classification forever.
-        if (backlog and backlog.category == "new" and revision.published_at
-                and revision.published_at < backlog.first_eligible_at - timedelta(days=7)):
-            if revision.important_at and revision.important_at >= backlog.first_eligible_at - timedelta(days=7):
+        if (backlog and backlog.category == "new" and annotation.start_at
+                and annotation.start_at < backlog.first_eligible_at - timedelta(days=7)):
+            if projection.important_at and projection.important_at >= backlog.first_eligible_at - timedelta(days=7):
                 backlog.category = "update"
             else:
                 from .service import audit
                 audit(db, "report-worker", "backlog.disclosure_invalidated", revision.vulnerability_id)
                 db.delete(backlog)
                 backlog = None
-        if revision.published_at is None:
+        if backlog and backlog.category == "update" and projection.important_at is None:
+            from .service import audit
+            audit(db, "report-worker", "backlog.unverified-change-date", revision.vulnerability_id)
+            db.delete(backlog)
+            backlog = None
+        uncertain_window = (annotation.status == "day" and annotation.start_at <= batch.cutoff
+                            and annotation.end_at >= start and not date_in_window(annotation, start, batch.cutoff))
+        if annotation.status not in VERIFIED or uncertain_window:
             db.add(UnverifiedItem(batch_id=batch.id, revision_id=revision.id,
                                  title=revision.snapshot["title"],
                                  identifiers=", ".join(revision.snapshot.get("aliases", [])),
-                                 references=revision.snapshot.get("references", [])))
+                                 references=revision.snapshot.get("references", []), date_annotation_id=annotation.id,
+                                 reason="uncertain_window" if uncertain_window else annotation.status))
             state.unknown_count += 1
         elif new or important or (backlog and (old is None or revision.id > old.id)):
             risk = {"unknown": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
-            facts = revision.snapshot
             rank = (10 if facts.get("exploited") else 0) + risk.get(facts.get("severity"), 0)
             if backlog is None:
                 db.add(ReportBacklog(vulnerability_id=revision.vulnerability_id, revision_id=revision.id,
@@ -179,6 +211,7 @@ def prepare_step(db, batch, state):
                 backlog.revision_id, backlog.rank = revision.id, rank
             db.add(ReportCandidate(batch_id=batch.id, vulnerability_id=revision.vulnerability_id,
                                    revision_id=revision.id,
+                                   date_annotation_id=annotation.id,
                                    first_eligible_at=backlog.first_eligible_at if backlog else batch.cutoff,
                                    category=backlog.category if backlog else "new" if new else "update", rank=rank))
         state.cursor = identity
@@ -206,9 +239,12 @@ def select_step(db, batch, state):
         if used and used + revision.snapshot_bytes > 2_000_000:
             break
         start = batch.cutoff - timedelta(days=7)
-        event_at = revision.published_at if candidate.category == "new" else revision.important_at
+        annotation = db.get(PublicationAnnotation, candidate.date_annotation_id) if candidate.date_annotation_id else None
+        projection = db.get(RevisionDateProjection, revision.id)
+        facts = corrected_snapshot(revision, projection, annotation)
+        event_at = annotation.start_at if candidate.category == "new" else projection.important_at
         is_backlog = candidate.first_eligible_at < start or not event_at or event_at < start
-        facts = {**revision.snapshot, "report_category": candidate.category,
+        facts = {**facts, "report_category": candidate.category,
                  "report_backlog": is_backlog, "first_eligible_at": iso(candidate.first_eligible_at)}
         item = BatchItem(batch_id=batch.id, vulnerability_id=candidate.vulnerability_id, snapshot=facts, priority=True)
         db.add(item)
@@ -258,6 +294,11 @@ def batch_page(db, batch_id, after=0, limit=10, pending_only=False):
     page, size = [], 0
     for row in rows[:limit]:
         snapshot = {name: row._mapping[name] for name in names}
+        timeline = snapshot.get("timeline") or {}
+        snapshot["timeline"] = {key: value for key, value in timeline.items() if key not in {
+            "date_evidence", "date_conflicts", "rejected_date_evidence", "source_publications", "date_fetches", "event_dates",
+            "cve_record_publications", "source_entry_publications"}}
+        snapshot["date_evidence_complete"] = False
         snapshot["title"] = row._mapping["title"] or ""
         snapshot["title_complete"] = (row._mapping["title_length"] or 0) <= 500
         aliases = snapshot.get("aliases") or []
@@ -304,6 +345,8 @@ def finalize(db, actor, batch_id, summary="", overview=None):
     state = db.get(ReportState, batch_id)
     if not state:
         raise ValueError("旧规则批次不能用新规则自动重发，请建立新的时间段报告")
+    if state.policy < EVENT_POLICY or status(db, batch)["date_audit_required"]:
+        raise ValueError("未发布批次仍使用旧日期规则，请运行 repair-publication-dates --rebuild-unpublished")
     if not state.work.get("prepared"):
         raise ValueError("批次尚未准备完成")
     missing = db.scalar(select(func.count()).select_from(BatchItem).where(

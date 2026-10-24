@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 from .config import settings
 
 SEVERITY = {"critical": "严重", "high": "高危", "medium": "中危", "low": "低危", "unknown": "未评分"}
+DATE_STATUS = {"confirmed": "有可核对公开依据", "day": "仅精确到日", "unknown": "待核实", "conflict": "日期冲突待核实"}
 EVIDENCE = {"vendor_confirmed": "厂商确认", "public_poc": "公开 PoC", "third_party_verified": "第三方验证",
             "inference": "推测", "unknown": "未确认"}
 FIELDS = {"vulnerability_summary": "漏洞说明", "root_cause": "漏洞原理", "trigger_conditions": "触发条件",
@@ -17,6 +18,7 @@ FONT = "'Microsoft YaHei','PingFang SC','Noto Sans CJK SC',sans-serif"
 def report_scope(state):
     work = state.work
     return {"item_limit": work.get("item_limit"), "candidate_total": work.get("candidate_total", state.total),
+            "date_policy": work.get("date_policy"), "date_coverage": work.get("date_coverage"),
             "deferred_count": work.get("deferred_count", 0), "backlog_selected": work.get("backlog_selected", 0),
             "current_new_disclosures": state.new_count - work.get("backlog_new", 0),
             "recent_important_updates": state.update_count - work.get("backlog_updates", 0)}
@@ -97,8 +99,10 @@ def article(item):
               f'{"是" if facts.get("exploited") else "未确认"}</p><p style="overflow-wrap:anywhere">编号：{ESC(identifiers)}</p>'
               f'<p style="font-size:13px;color:#50677a">公开时间：{ESC(label_time(timeline.get("published_at"), timeline.get("publication_precision")))}<br>'
               f'时间依据：{text(timeline.get("publication_basis"))}；来源：{text(timeline.get("publication_source"))}<br>'
+              f'日期状态：{text(DATE_STATUS.get(timeline.get("publication_status"), "待核实"))}；原始值：{text(timeline.get("publication_original"))}<br>'
               f'上游更新时间：{ESC(label_time(timeline.get("upstream_updated_at")))}<br>'
-              f'重要变化时间：{ESC(label_time(timeline.get("material_changed_at")))}；依据：{text(timeline.get("change_basis"))}<br>'
+              f'重要变化时间：{ESC(label_time(timeline.get("material_changed_at"), timeline.get("important_precision")))}；依据：{text(timeline.get("change_basis"))}<br>'
+              f'本库观察到变化：{ESC(label_time(timeline.get("change_observed_at")))}<br>'
               f'首次待报时间：{ESC(label_time(facts.get("first_eligible_at")))}</p>')
     for field, label in FIELDS.items():
         value = analysis.get(field) or "未公开／未确认"
@@ -106,7 +110,7 @@ def article(item):
             value = EVIDENCE.get(value, "未确认")
         result += f'<h4 style="font-size:15px;margin:16px 0 4px;color:#173b61">{label}</h4><p style="margin:0;overflow-wrap:anywhere">{text(value)}</p>'
     return result + '<h4 style="font-size:15px;color:#173b61">参考来源</h4>' + references(
-        list(facts.get("references", [])) + list(analysis.get("references", []))) + "</article>"
+        list(facts.get("references", [])) + list(facts.get("date_references", [])) + list(analysis.get("references", []))) + "</article>"
 
 
 def markdown_article(item):
@@ -116,6 +120,9 @@ def markdown_article(item):
     result += f'类别：{category_label(facts)}；首次待报时间：{label_time(facts.get("first_eligible_at"))}\n\n'
     timeline = facts.get("timeline", {})
     result += f'公开时间：{label_time(timeline.get("published_at"), timeline.get("publication_precision"))}；时间依据：{ESC(timeline.get("publication_basis", "未确认"))}\n\n'
+    result += f'日期原始值：{ESC(str(timeline.get("publication_original") or "未确认"))}；状态：{DATE_STATUS.get(timeline.get("publication_status"), "待核实")}\n\n'
+    result += f'重要变化时间：{label_time(timeline.get("material_changed_at"), timeline.get("important_precision"))}；依据：{ESC(str(timeline.get("change_basis") or "未确认"))}\n\n'
+    result += f'本库观察到变化：{label_time(timeline.get("change_observed_at"))}\n\n'
     result += f'上游更新时间：{label_time(timeline.get("upstream_updated_at"))}\n\n'
     for field, label in FIELDS.items():
         value = analysis.get(field) or "未公开／未确认"
@@ -123,7 +130,7 @@ def markdown_article(item):
             value = EVIDENCE.get(value, "未确认")
         result += f'#### {label}\n\n{ESC(value)}\n\n'
     return result + "参考来源：\n\n" + "".join("- " + ESC(url) + "\n" for url in sorted(set(
-        list(facts.get("references", [])) + list(analysis.get("references", []))))) + "\n"
+        list(facts.get("references", [])) + list(facts.get("date_references", [])) + list(analysis.get("references", []))))) + "\n"
 
 
 def coverage(batch, state):

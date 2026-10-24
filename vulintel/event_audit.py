@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from sqlalchemy import select
 
-from .db import Alias, Batch, BatchItem, Revision
+from .db import Alias, Batch, BatchItem, PublicationAnnotation, PublicationState
 from .identity import CVE_ID, record_aliases
 from .timeline import EVENT_POLICY, derive_revision, iso, stamp
 
@@ -99,22 +99,11 @@ def audit_report(db, batch_id):
         if not aliases:
             return dates
         ids = list(db.scalars(select(Alias.vulnerability_id).where(Alias.alias.in_(aliases)).distinct()))
-        for identity in ids:
-            publications = {}
-            revision_ids = db.scalars(select(Revision.id).where(Revision.vulnerability_id == identity,
-                                      Revision.observed_at <= batch.cutoff).order_by(Revision.observed_at, Revision.id))
-            for revision_id in revision_ids:
-                revision = db.get(Revision, revision_id)
-                projection = derive_revision(SimpleNamespace(id=identity, data=revision.snapshot),
-                                             observed=batch.cutoff, baseline=True)
-                # Late identity merges retain separate historical snapshots. Keep
-                # the last known publication claim per source entry, rather than
-                # letting a later distro-only snapshot hide an earlier NVD source.
-                for claim in projection.snapshot["timeline"]["source_publications"]:
-                    publications[(claim["source"], claim["source_key"])] = (
-                        stamp(claim["published_at"]) if claim["valid"] and claim["scope"] != "source_record" else None)
-                db.expunge(revision)
-            dates.extend(value for value in publications.values() if value is not None)
+        from .publication import DATE_POLICY, VERIFIED
+        dates.extend(db.scalars(select(PublicationAnnotation.start_at).join(PublicationState,
+             PublicationState.annotation_id == PublicationAnnotation.id).where(
+             PublicationState.vulnerability_id.in_(ids), PublicationState.policy == DATE_POLICY,
+             PublicationAnnotation.status.in_(VERIFIED), PublicationAnnotation.start_at.is_not(None))))
         return dates
 
     items = db.execute(select(BatchItem.id, BatchItem.snapshot).where(BatchItem.batch_id == batch_id)

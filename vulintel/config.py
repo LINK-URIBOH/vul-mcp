@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     source_interval_seconds: int = 3600
     delivery_max_attempts: int = 5
     report_max_items: int = Field(default=50, ge=1, le=10000)
+    publication_request_interval: float = Field(default=1.0, ge=0.1, le=60)
+    publication_cache_hours: int = Field(default=168, ge=1, le=8760)
+    publication_reference_hosts: str = ("msrc.microsoft.com,support.apple.com,source.android.com,nodejs.org,go.dev,"
+                                        "www.python.org,github.com,www.cisco.com,sec.cloudapps.cisco.com,"
+                                        "www.fortiguard.com,www.debian.org,ubuntu.com,access.redhat.com,"
+                                        "www.zerodayinitiative.com,googleprojectzero.blogspot.com")
 
     @model_validator(mode="after")
     def validate_config(self):

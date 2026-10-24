@@ -166,7 +166,7 @@ class Revision(Base):
 class ReportState(Base):
     __tablename__ = "report_states"
     batch_id: Mapped[str] = mapped_column(ForeignKey("batches.id"), primary_key=True)
-    policy: Mapped[int] = mapped_column(Integer, default=4)
+    policy: Mapped[int] = mapped_column(Integer, default=5)
     watermark: Mapped[int | None] = mapped_column(Integer)
     cursor: Mapped[int] = mapped_column(Integer, default=0)
     total: Mapped[int] = mapped_column(Integer, default=0)
@@ -196,6 +196,8 @@ class UnverifiedItem(Base):
     title: Mapped[str] = mapped_column(Text)
     identifiers: Mapped[str] = mapped_column(Text)
     references: Mapped[list] = mapped_column(JSON, default=list)
+    date_annotation_id: Mapped[int | None] = mapped_column(ForeignKey("publication_annotations.id"))
+    reason: Mapped[str | None] = mapped_column(String(80))
 
 
 class ReportBacklog(Base):
@@ -217,6 +219,50 @@ class ReportCandidate(Base):
     first_eligible_at: Mapped[datetime] = mapped_column(DateTime)
     category: Mapped[str] = mapped_column(String(30))
     rank: Mapped[int] = mapped_column(Integer)
+    date_annotation_id: Mapped[int | None] = mapped_column(ForeignKey("publication_annotations.id"))
+
+
+class PublicationAnnotation(Base):
+    """Append-only date decisions; raw source and historical fact snapshots stay intact."""
+    __tablename__ = "publication_annotations"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vulnerability_id: Mapped[str] = mapped_column(String(36), index=True)
+    policy: Mapped[int] = mapped_column(Integer)
+    assessed_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    status: Mapped[str] = mapped_column(String(30), index=True)
+    start_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    end_at: Mapped[datetime | None] = mapped_column(DateTime)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    data: Mapped[dict] = mapped_column(JSON)
+
+
+class PublicationState(Base):
+    __tablename__ = "publication_states"
+    vulnerability_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    annotation_id: Mapped[int] = mapped_column(ForeignKey("publication_annotations.id"), index=True)
+    policy: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(30), index=True)
+    start_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    end_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class RevisionDateProjection(Base):
+    __tablename__ = "revision_date_projections"
+    revision_id: Mapped[int] = mapped_column(ForeignKey("vulnerability_revisions.id"), primary_key=True)
+    policy: Mapped[int] = mapped_column(Integer)
+    important_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    important_end_at: Mapped[datetime | None] = mapped_column(DateTime)
+    timeline: Mapped[dict] = mapped_column(JSON)
+
+
+class DateEvidenceCache(Base):
+    __tablename__ = "date_evidence_cache"
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    url: Mapped[str] = mapped_column(Text)
+    checked_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    retry_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    status: Mapped[str] = mapped_column(String(30))
+    data: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 def build_engine(url):
@@ -250,7 +296,7 @@ def migrate():
         from sqlalchemy import select
         Migration.__table__.create(conn, checkfirst=True)
         versions = set(conn.execute(select(Migration.version)).scalars())
-        if versions - {1, 2, 3} or (2 in versions and 1 not in versions) or (3 in versions and 2 not in versions):
+        if versions - {1, 2, 3, 4} or any(v in versions and v - 1 not in versions for v in (2, 3, 4)):
             raise ValueError("数据库迁移版本不兼容，拒绝自动修改")
         if 1 not in versions:
             for table in [Source, Vulnerability, Alias, SourceRecord, Batch, BatchItem, Delivery,
@@ -265,3 +311,7 @@ def migrate():
             from .migrations import migration_003
             migration_003(conn)
             conn.execute(Migration.__table__.insert().values(version=3, applied=now()))
+        if 4 not in versions:
+            from .migrations import migration_004
+            migration_004(conn)
+            conn.execute(Migration.__table__.insert().values(version=4, applied=now()))

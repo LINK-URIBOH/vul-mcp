@@ -21,7 +21,8 @@ log = logging.getLogger("vulintel.maintenance")
 
 
 def progress(db):
-    row = db.get(MetadataState, KEY)
+    from .publication import REPAIR_KEY
+    row = db.get(MetadataState, REPAIR_KEY) or db.get(MetadataState, KEY)
     if not row:
         return None
     value = dict(row.value)
@@ -35,8 +36,9 @@ def progress(db):
 
 
 def active(db):
-    row = db.get(MetadataState, KEY)
-    return bool(row and not row.value.get("complete"))
+    from .publication import REPAIR_KEY
+    return any(row and not row.value.get("complete") for row in
+               (db.get(MetadataState, KEY), db.get(MetadataState, REPAIR_KEY)))
 
 
 def report_write_guard(db):
@@ -45,6 +47,10 @@ def report_write_guard(db):
     if db.bind.dialect.name == "postgresql":
         db.execute(text("SELECT pg_advisory_xact_lock(86221023)"))
     if active(db):
+        from .publication import DATES_BLOCKED, REPAIR_KEY
+        row = db.get(MetadataState, REPAIR_KEY)
+        if row and not row.value.get("complete"):
+            raise ValueError(DATES_BLOCKED)
         raise ValueError(BLOCKED)
 
 

@@ -23,7 +23,8 @@ CUTOFF = datetime(2026, 10, 1, 10)
 
 def seed(db, name="CVE-2026-10001", **extra):
     return ingest(db, "nvd", entry(name, "测试漏洞 " + name, "完整公开事实", [name],
-                  ["https://example.org/advisory"], published="2026-09-30T00:00:00Z", **extra))
+                  ["https://example.org/advisory"], published="2026-09-30T00:00:00Z",
+                  disclosed_at="2026-09-30T00:00:00Z", disclosure_reference="https://example.org/advisory", **extra))
 
 
 def freeze_time(monkeypatch):
@@ -218,7 +219,8 @@ def test_evidence_update_after_freeze_remains_pending_and_limit_is_frozen(store,
         item = db.scalar(select(BatchItem).where(BatchItem.batch_id == bid))
         original = copy.deepcopy(item.snapshot)
         monkeypatch.setattr("vulintel.timeline.now", lambda: CUTOFF + timedelta(hours=1))
-        seed(db, affected=[{"product": "P", "versions": ["1", "2"]}])
+        seed(db, affected=[{"product": "P", "versions": ["1", "2"]}],
+             remediations=[{"Date": (CUTOFF + timedelta(hours=1)).isoformat() + "Z", "Description": "Vendor Fix"}])
         db.commit()
         new_id = db.get(ReportBacklog, identity).revision_id
         assert status(db, db.get(Batch, bid))["item_limit"] == 50
@@ -418,7 +420,8 @@ def test_authoritative_older_publication_invalidates_false_new_backlog(store, mo
         drain(db, bid, "analyzing")
         finish(db, bid)
         value = entry("CVE-2026-10102", "公开日期校正", "实际早于本周", ["CVE-2026-10102"],
-                      ["https://example.org/advisory"], published="2020-01-01T00:00:00Z", severity="low")
+                      ["https://example.org/advisory"], published="2020-01-01T00:00:00Z", severity="low",
+                      disclosed_at="2020-01-01T00:00:00Z", disclosure_reference="https://example.org/advisory")
         ingest(db, "nvd", value)
         db.commit()
         bid = open_batch(db, "test", "2026-10-02T18:00+08:00")["batch_id"]

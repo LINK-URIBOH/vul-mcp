@@ -17,6 +17,10 @@ from vulintel.sources import collect_one, entry, ghsa_record, kev_record, nvd_re
 def record(alias="CVE-2026-12345", **kwargs):
     cutoff = datetime.fromisoformat(due_slot()).replace(tzinfo=None) - timedelta(hours=8)
     kwargs.setdefault("published", (cutoff - timedelta(days=1)).isoformat() + "Z")
+    # Workflow fixtures represent a dated original disclosure, not just an NVD
+    # entry timestamp. Production adapters must supply independent date evidence.
+    kwargs.setdefault("disclosed_at", kwargs["published"])
+    kwargs.setdefault("disclosure_reference", "https://example.org/advisory")
     return entry(alias, "示例漏洞", "原始公告", [alias], ["https://example.org/advisory"],
                  [{"product": "Python"}], severity="high", **kwargs)
 
