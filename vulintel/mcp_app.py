@@ -58,6 +58,8 @@ async def transaction(function, *args):
                      "批次尚未准备完成，或已进入渲染阶段", "分析引用了不属于此批次的条目", "批次不存在或已经归档",
                      "时间段必须为北京时间 09:00 或 18:00，包含 +08:00 时区", "旧规则批次不能用新规则自动重发，请建立新的时间段报告")
             raw = str(exc) if isinstance(exc, ValueError) else ""
+            from .maintenance import BLOCKED
+            known = (*known, BLOCKED)
             message = raw if raw in known or re.fullmatch(r"仍有\d+条记录需要完成逐条详解", raw) else "服务端处理失败或参数无效，请核对服务日志"
             raise ToolError(f"{message[:240]}；追踪编号 {correlation}") from None
     return await asyncio.to_thread(invoke)
@@ -71,7 +73,9 @@ def make_mcp(verifier=None):
                       "Use paginated batches and submit evidence-linked analysis. Never invent verification. "
                       "Preparing is not empty: poll get_report_status. Read full get_item_evidence pages. "
                       "Analyze ALL selected items in Chinese before finalization. Finalize queues rendering; "
-                      "only finalized means files are published, not delivered. Delivery targets are server configured."),
+                      "only finalized means files are published, not delivered. Delivery targets are server configured. "
+                      "Selection is capped; overflow persists. Respect report_backlog and first_eligible_at; "
+                      "never claim selected items cover all candidates."),
         auth=AuthSettings(issuer_url=cfg.issuer_url, resource_server_url=cfg.resource_url,
                           required_scopes=["vul.read"], validate_token_resource=True),
         token_verifier=verifier or Verifier(cfg),
@@ -84,6 +88,8 @@ def make_mcp(verifier=None):
         principal("vul.read")
         result = {"service_name": "vul-intel", "service_version": __version__,
                   "server_time_utc": datetime.now(timezone.utc).isoformat(), "marker": marker}
+        from .maintenance import progress
+        result["maintenance"] = await transaction(progress)
         logging.getLogger("vulintel").info(json.dumps({"event": "health_check", "result": result}))
         return result
 

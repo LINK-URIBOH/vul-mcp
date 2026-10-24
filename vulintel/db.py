@@ -166,7 +166,7 @@ class Revision(Base):
 class ReportState(Base):
     __tablename__ = "report_states"
     batch_id: Mapped[str] = mapped_column(ForeignKey("batches.id"), primary_key=True)
-    policy: Mapped[int] = mapped_column(Integer, default=3)
+    policy: Mapped[int] = mapped_column(Integer, default=4)
     watermark: Mapped[int | None] = mapped_column(Integer)
     cursor: Mapped[int] = mapped_column(Integer, default=0)
     total: Mapped[int] = mapped_column(Integer, default=0)
@@ -196,6 +196,27 @@ class UnverifiedItem(Base):
     title: Mapped[str] = mapped_column(Text)
     identifiers: Mapped[str] = mapped_column(Text)
     references: Mapped[list] = mapped_column(JSON, default=list)
+
+
+class ReportBacklog(Base):
+    """One outstanding, coalesced report candidate per canonical vulnerability."""
+    __tablename__ = "report_backlog"
+    vulnerability_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    revision_id: Mapped[int] = mapped_column(ForeignKey("vulnerability_revisions.id"), index=True)
+    first_eligible_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    category: Mapped[str] = mapped_column(String(30))
+    rank: Mapped[int] = mapped_column(Integer)
+
+
+class ReportCandidate(Base):
+    """Small per-batch staging rows: concurrent ingest cannot change the frozen scan."""
+    __tablename__ = "report_candidates"
+    batch_id: Mapped[str] = mapped_column(ForeignKey("batches.id"), primary_key=True)
+    vulnerability_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    revision_id: Mapped[int] = mapped_column(ForeignKey("vulnerability_revisions.id"))
+    first_eligible_at: Mapped[datetime] = mapped_column(DateTime)
+    category: Mapped[str] = mapped_column(String(30))
+    rank: Mapped[int] = mapped_column(Integer)
 
 
 def build_engine(url):
@@ -229,7 +250,7 @@ def migrate():
         from sqlalchemy import select
         Migration.__table__.create(conn, checkfirst=True)
         versions = set(conn.execute(select(Migration.version)).scalars())
-        if versions - {1, 2} or (2 in versions and 1 not in versions):
+        if versions - {1, 2, 3} or (2 in versions and 1 not in versions) or (3 in versions and 2 not in versions):
             raise ValueError("数据库迁移版本不兼容，拒绝自动修改")
         if 1 not in versions:
             for table in [Source, Vulnerability, Alias, SourceRecord, Batch, BatchItem, Delivery,
@@ -240,3 +261,7 @@ def migrate():
             from .migrations import migration_002
             migration_002(conn)
             conn.execute(Migration.__table__.insert().values(version=2, applied=now()))
+        if 3 not in versions:
+            from .migrations import migration_003
+            migration_003(conn)
+            conn.execute(Migration.__table__.insert().values(version=3, applied=now()))

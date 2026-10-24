@@ -9,8 +9,8 @@ from sqlalchemy import or_, select
 from .db import MetadataState, Revision, SourceRecord, Vulnerability, now
 from .identity import publication_scope, record_aliases
 
-EVENT_POLICY = 3
-BACKFILL_KEY = "source_event_backfill_v3"
+EVENT_POLICY = 4
+BACKFILL_KEY = "source_event_backfill_v4"
 
 
 def stamp(value):
@@ -236,9 +236,13 @@ def backfill_step(db, limit=100):
             record = db.get(SourceRecord, identity)
             budget += len(json.dumps(record.data, ensure_ascii=False).encode())
             if record_aliases(record.data) != record.data.get("aliases", []):
-                ingest(db, record.source_id, record.data)
                 value["relinked_records"] = value.get("relinked_records", 0) + 1
+            # Rebuild even already-normalized records: v3 may have checkpointed
+            # their aliases without replaying all merged facts. Never emit an
+            # event (or change updated_at) merely because maintenance ran.
+            ingest(db, record.source_id, record.data, maintenance=True)
             value["alias_cursor"] = identity
+            value["alias_processed"] = value.get("alias_processed", 0) + 1
             db.flush()
             db.expunge(record)
             if budget >= 2_000_000:
@@ -268,20 +272,30 @@ def backfill_step(db, limit=100):
             legacy = db.scalar(select(Revision.id).where(Revision.vulnerability_id == identity,
                                or_(policy_column != EVENT_POLICY, policy_column.is_(None))).limit(1))
         if latest is not None and (latest.snapshot.get("timeline", {}).get("event_policy") != EVENT_POLICY
-                                   or (legacy and not latest.snapshot.get("timeline", {}).get("history_replayed"))):
+                                   or (legacy and not latest.snapshot.get("timeline", {}).get("history_replayed"))
+                                   or any(latest.snapshot.get(key) != child for key, child in vuln.data.items()
+                                          if key != "timeline")):
             # Replay original facts in observation order. This preserves actual old
             # impact changes while removing zero dates and version-enumeration noise.
             # Only append the final corrected projection; keep all originals intact.
             from types import SimpleNamespace
             revision_ids = list(db.scalars(select(Revision.id).where(Revision.vulnerability_id == identity)
                                            .order_by(Revision.observed_at, Revision.id)))
-            projection = None
+            projection, source_history = None, {}
             for revision_id in revision_ids:
                 original = db.get(Revision, revision_id)
-                projection = derive_revision(SimpleNamespace(id=identity, data=original.snapshot),
+                for facts in original.snapshot.get("source_records", []):
+                    source_history[(facts.get("source"), facts.get("source_key"))] = facts
+                data = {**original.snapshot, "source_records": list(source_history.values())}
+                if source_history:
+                    data["exploited"] = any(facts.get("exploited", False) for facts in source_history.values())
+                projection = derive_revision(SimpleNamespace(id=identity, data=data),
                                              projection, observed=original.observed_at, baseline=projection is None)
                 if original is not latest:
                     db.expunge(original)
+            # The final projection must represent ALL current canonical records,
+            # rather than whichever pre-merge identity happened to be seen last.
+            projection = derive_revision(vuln, projection, observed=projection.observed_at, baseline=True)
             projection.snapshot = {**projection.snapshot, "timeline": {**projection.snapshot["timeline"],
                                                                          "history_replayed": True}}
             projection.snapshot_bytes = len(json.dumps(projection.snapshot, ensure_ascii=False).encode())

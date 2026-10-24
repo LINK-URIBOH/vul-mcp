@@ -6,3 +6,10 @@ def migration_002(connection):
     from .db import MetadataState, ReportSelection, ReportState, Revision, UnverifiedItem
     for table in [MetadataState, Revision, ReportState, ReportSelection, UnverifiedItem]:
         table.__table__.create(connection, checkfirst=True)
+
+
+def migration_003(connection):
+    """Persistent deferred candidates; existing reports and facts are unchanged."""
+    from .db import ReportBacklog, ReportCandidate
+    for table in [ReportBacklog, ReportCandidate]:
+        table.__table__.create(connection, checkfirst=True)

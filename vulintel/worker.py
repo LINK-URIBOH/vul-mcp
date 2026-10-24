@@ -34,6 +34,9 @@ def tick_delivery():
 
 def work_once():
     with session() as db:
+        from .maintenance import active
+        if active(db):
+            return False
         for stale in db.scalars(select(Job).where(Job.kind == "collect", Job.status == "running", Job.lease_until < now())):
             stale.status, stale.error = "failed", "工作进程中断或租约过期，请重试"
         db.commit()
@@ -84,7 +87,7 @@ def main():
             raise RuntimeError("Another worker already owns the collector lock")
         lock.commit()
     with session() as db:
-        for interrupted in db.scalars(select(Job).where(Job.status == "running")):
+        for interrupted in db.scalars(select(Job).where(Job.status == "running", Job.kind != "maintenance")):
             interrupted.status = "pending" if interrupted.kind == "report" else "failed"
             interrupted.lease_until = None
             interrupted.error = None if interrupted.kind == "report" else "上次工作进程中断，请重试"

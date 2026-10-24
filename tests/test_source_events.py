@@ -11,7 +11,7 @@ from vulintel.event_audit import audit_items, audit_report
 from vulintel.identity import record_aliases
 from vulintel.service import ingest, open_batch
 from vulintel.sources import entry, osv_record
-from vulintel.timeline import BACKFILL_KEY, backfill_step, derive_revision, stamp
+from vulintel.timeline import BACKFILL_KEY, EVENT_POLICY, backfill_step, derive_revision, stamp
 
 
 OBSERVED = datetime(2026, 10, 23, 9)
@@ -164,7 +164,7 @@ def test_metadata_repair_replays_real_changes_and_keeps_frozen_batch(store, monk
             db.commit()
         db.commit()
         latest = db.scalar(select(Revision).order_by(Revision.id.desc()).limit(1))
-        assert latest.snapshot["timeline"]["event_policy"] == 3
+        assert latest.snapshot["timeline"]["event_policy"] == EVENT_POLICY
         assert latest.important_at == OBSERVED + timedelta(seconds=1)
         assert latest.first_seen_at == initial.first_seen_at
         assert initial.snapshot == before

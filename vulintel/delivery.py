@@ -99,6 +99,9 @@ def send_email(delivery):
 
 
 def deliver_one(db, sender=None):
+    from .maintenance import active
+    if active(db):
+        return False
     cfg = settings()
     if not cfg.delivery_enabled:
         return False

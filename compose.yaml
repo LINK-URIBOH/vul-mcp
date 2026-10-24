@@ -1,11 +1,12 @@
 name: vul-intel
 x-app: &app
-  image: vul-intel:1.1.1
+  image: vul-intel:1.2.0
   env_file: .env
   environment:
     DATABASE_URL: postgresql+psycopg://vul:${VUL_DB_PASSWORD:?run bootstrap}@db/vul
     KEYCLOAK_INTERNAL_URL: http://keycloak:8080/auth/realms/vul
     DATA_DIR: /data
+    REPORT_MAX_ITEMS: ${REPORT_MAX_ITEMS:-50}
   restart: unless-stopped
   init: true
   user: "10001:10001"

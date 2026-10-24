@@ -5,11 +5,12 @@ import io
 import json
 import os
 
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, delete, or_, select, update
 
 from .config import settings
-from .db import BatchItem, Delivery, ReportSelection, Revision, UnverifiedItem, uid
-from .report_content import ESC, FONT, SEVERITY, article, coverage, header, markdown_article, references
+from .db import BatchItem, Delivery, ReportBacklog, ReportSelection, Revision, UnverifiedItem, uid
+from .report_content import (ESC, FONT, SEVERITY, article, category_label, coverage, header, markdown_article,
+                             references, report_scope, scope_text)
 from .reports import csv_safe, export_item, report_dir
 from .timeline import iso
 
@@ -50,7 +51,7 @@ def save_webhook(db, batch, state, work, values):
     identity = uid()
     number = work.get("webhook_parts", 0) + 1
     payload = {"schema_version": "2.0", "message_id": identity, "report_id": batch.id, "slot": batch.slot,
-               "part": number, "parts": 0, "summary": f"逐条详解 {state.total} 条，日期待核实 {state.unknown_count} 条",
+               "part": number, "parts": 0, "summary": scope_text(state), "report_scope": report_scope(state),
                "coverage": batch.coverage, "overview": state.overview, "items": values,
                "raw_evidence": "完整原始事实见归档 report.json；本消息包含有界事实和完整分析"}
     if len(json.dumps(payload, ensure_ascii=False).encode()) > 512_000:
@@ -103,14 +104,14 @@ def render_step(db, batch, state):
     if not work.get("started"):
         append(root, work, "report.html", '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>漏洞情报报告</title>'
                f'<style>body{{margin:0;background:#f4f7fa;font-family:{FONT}}}p,li{{overflow-wrap:anywhere}} @media(max-width:600px){{h1{{font-size:23px}}}}</style></head><body>' + header(batch, state) + "<h2>漏洞详情</h2>")
-        append(root, work, "report.md", f"# 漏洞情报报告\n\n报告编号：{batch.id}\n\n时间段：{batch.slot}\n\n近期公开 {state.new_count} 条；重要更新 {state.update_count} 条；日期待核实 {state.unknown_count} 条。\n\n")
+        append(root, work, "report.md", f"# 漏洞情报报告\n\n报告编号：{batch.id}\n\n时间段：{batch.slot}\n\n{scope_text(state)}\n\n公开日期待核实 {state.unknown_count} 条。\n\n")
         for key, label in [("risk_summary", "核心风险"), ("repair_priorities", "优先修复建议")]:
             if state.overview.get(key):
                 append(root, work, "report.md", f"## {label}\n\n" + "".join(f"- {ESC(v)}\n" for v in state.overview[key]) + "\n")
         metadata = {"schema_version": "2.0", "report_id": batch.id, "slot": batch.slot,
                     "overview": state.overview, "total": state.total, "new_disclosures": state.new_count,
                     "important_updates": state.update_count, "unknown_dates": state.unknown_count,
-                    "coverage_at_utc": iso(state.coverage_at), "coverage": batch.coverage}
+                    "coverage_at_utc": iso(state.coverage_at), "coverage": batch.coverage, **report_scope(state)}
         append(root, work, "report.json", json.dumps(metadata, ensure_ascii=False)[:-1] + ',"items":[')
         append(root, work, "index.csv", "\ufeff" + columns)
         append(root, work, "unverified.csv", "\ufeff" + unknown_columns)
@@ -136,7 +137,7 @@ def render_step(db, batch, state):
             timeline = facts.get("timeline", {})
             line = csv_row([", ".join(facts.get("aliases", [])), facts["title"], group,
                             SEVERITY.get(facts.get("severity"), "未评分"),
-                            "近期公开" if facts.get("report_category") == "new" else "重要更新",
+                            category_label(facts),
                             timeline.get("published_at"), timeline.get("publication_basis"),
                             " ".join(facts.get("references", []))])
             append(root, work, "index.csv", line)
@@ -144,7 +145,8 @@ def render_step(db, batch, state):
                 mail_part(root, work, article(item), batch, state)
                 attachment_row(root, work, line, "index-part", columns)
             if "webhook" in channels:
-                bounded = {k: facts.get(k) for k in ["aliases", "title", "severity", "exploited", "timeline", "product_group", "report_category"]}
+                bounded = {k: facts.get(k) for k in ["aliases", "title", "severity", "exploited", "timeline", "product_group",
+                                                   "report_category", "report_backlog", "first_eligible_at"]}
                 bounded["title"] = facts["title"][:500]
                 bounded["title_complete"] = len(facts["title"]) <= 500
                 bounded["aliases"] = facts.get("aliases", [])[:100]
@@ -254,7 +256,7 @@ def render_step(db, batch, state):
             elif offset < attachment_count:
                 attachment = root / f'unverified-part-{number - work.get("index-part_parts", 0)}.csv'
             payload = {"schema_version": "2.0", "slot": batch.slot,
-                       "summary": f"逐条详解 {state.total} 条；公开日期待核实 {state.unknown_count} 条。",
+                       "summary": scope_text(state), "report_scope": report_scope(state),
                        "coverage": batch.coverage, "attachment": str(attachment) if attachment else None,
                        "html_body": str(root / f"email-body-{number}.html") if offset < work.get("body_parts", 0) else None,
                        "parts": parts}
@@ -275,6 +277,14 @@ def render_step(db, batch, state):
         if not rows:
             work["phase"] = "complete"
             batch.status, batch.error = "finalized", None
+            # Publication and coverage acknowledgement are one DB transaction.
+            # Evidence learned after selection remains queued for a later batch.
+            selections = select(ReportSelection.revision_id).join(BatchItem).where(BatchItem.batch_id == batch.id)
+            db.execute(delete(ReportBacklog).where(ReportBacklog.revision_id.in_(selections)))
+            remaining = db.scalars(select(ReportBacklog).where(ReportBacklog.vulnerability_id.in_(
+                select(BatchItem.vulnerability_id).where(BatchItem.batch_id == batch.id))))
+            for candidate in remaining:
+                candidate.category = "update"
             db.execute(update(Delivery).where(Delivery.batch_id == batch.id, Delivery.status == "staged").values(status="pending"))
     outer["render"] = work
     outer["phase"] = "complete" if work["phase"] == "complete" else "render"

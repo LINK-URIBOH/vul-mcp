@@ -243,21 +243,21 @@ def test_subsequent_reports_skip_duplicate_disclosures_and_include_new_material_
 
 def test_additive_migration_keeps_old_archives_and_is_idempotent(store):
     from vulintel import db as database
-    from vulintel.db import Migration, ReportSelection
+    from vulintel.db import Migration, ReportBacklog, ReportCandidate, ReportSelection
     from sqlalchemy import delete
     with store() as db:
         old = Batch(id=uid(), slot="2000-01-01T09:00+08:00", cutoff=datetime(2000, 1, 1, 1), status="finalized", summary="旧报告")
         db.add(old)
-        db.execute(delete(Migration).where(Migration.version == 2))
+        db.execute(delete(Migration).where(Migration.version >= 2))
         db.commit()
     with database.engine().begin() as conn:
-        for table in [UnverifiedItem, ReportSelection, ReportState, Revision, MetadataState]:
+        for table in [ReportCandidate, ReportBacklog, UnverifiedItem, ReportSelection, ReportState, Revision, MetadataState]:
             table.__table__.drop(conn)
     database.migrate()
     database.migrate()
     with store() as db:
         assert db.get(Batch, old.id).summary == "旧报告"
-        assert db.scalar(select(func.count()).select_from(Migration)) == 2
+        assert db.scalar(select(func.count()).select_from(Migration)) == 3
 
 
 def test_historical_kev_import_does_not_become_today_update(store, cutoff):

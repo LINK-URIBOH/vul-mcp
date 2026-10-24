@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from pydantic import SecretStr, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     github_token: SecretStr = SecretStr("")
     source_interval_seconds: int = 3600
     delivery_max_attempts: int = 5
+    report_max_items: int = Field(default=50, ge=1, le=10000)
 
     @model_validator(mode="after")
     def validate_config(self):

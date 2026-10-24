@@ -5,10 +5,10 @@ import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Text, cast, exists, func, or_, select
+from sqlalchemy import Text, cast, delete, exists, func, or_, select
 from sqlalchemy.orm import aliased
 
-from .db import (Batch, BatchItem, Job, MetadataState, ReportSelection, ReportState, Revision,
+from .db import (Batch, BatchItem, Job, MetadataState, ReportBacklog, ReportCandidate, ReportSelection, ReportState, Revision,
                  UnverifiedItem, now, session, uid)
 from .timeline import BACKFILL_KEY, EVENT_POLICY, backfill_step, iso
 
@@ -63,11 +63,18 @@ def status(db, batch):
             "render_stage": state.work.get("render", {}).get("phase"),
             "rendered_items": state.work.get("render", {}).get("count", 0),
             "prepared_items": state.total, "coverage_at_utc": iso(state.coverage_at),
+            "item_limit": state.work.get("item_limit"), "candidate_total": state.work.get("candidate_total"),
+            "deferred_count": state.work.get("deferred_count"), "backlog_selected": state.work.get("backlog_selected", 0),
+            "current_new_disclosures": state.new_count - state.work.get("backlog_new", 0),
+            "recent_important_updates": state.update_count - state.work.get("backlog_updates", 0),
             "retry_after_seconds": 30 if batch.status in {"preparing", "rendering"} else None,
             "metadata_backfill": metadata.value if metadata else {"complete": False}}
 
 
 def open_batch(db, actor, slot=None):
+    from .maintenance import report_write_guard
+    from .config import settings
+    report_write_guard(db)
     from .service import audit, due_slot, source_status
     slot = slot or due_slot()
     cutoff = datetime.fromisoformat(slot)
@@ -87,7 +94,7 @@ def open_batch(db, actor, slot=None):
         state = db.get(ReportState, batch.id)
         if state and batch.status == "failed":
             batch.status = "analyzing" if state.work.get("prepared") else "preparing"
-            if state.work.get("phase") not in {"prepare", "analyzing"}:
+            if state.work.get("phase") not in {"prepare", "select", "analyzing"}:
                 batch.status = "rendering"
             batch.error = None
             if batch.status != "analyzing":
@@ -101,7 +108,8 @@ def open_batch(db, actor, slot=None):
     batch = Batch(id=uid(), slot=slot, cutoff=cutoff, status="preparing", coverage=source_status(db))
     db.add(batch)
     db.flush()
-    db.add(ReportState(batch_id=batch.id, work={"phase": "prepare", "prepared": False}))
+    db.add(ReportState(batch_id=batch.id, work={"phase": "prepare", "prepared": False,
+                                              "item_limit": settings().report_max_items}))
     enqueue(db, batch.id)
     audit(db, actor, "batch.create", batch.id)
     db.commit()
@@ -109,6 +117,9 @@ def open_batch(db, actor, slot=None):
 
 
 def prepare_step(db, batch, state):
+    if state.work.get("phase") == "select":
+        select_step(db, batch, state)
+        return
     if not backfill_step(db):
         return
     if state.watermark is None:
@@ -117,8 +128,10 @@ def prepare_step(db, batch, state):
     start = batch.cutoff - timedelta(days=7)
     later = exists(select(other.id).where(other.vulnerability_id == Revision.vulnerability_id,
                    other.id > Revision.id, other.id <= state.watermark, other.observed_at <= batch.cutoff))
+    queued = exists(select(ReportBacklog.vulnerability_id).where(
+        ReportBacklog.vulnerability_id == Revision.vulnerability_id))
     recent = or_(Revision.published_at.between(start, batch.cutoff),
-                 Revision.important_at.between(start, batch.cutoff), Revision.published_at.is_(None))
+                 Revision.important_at.between(start, batch.cutoff), Revision.published_at.is_(None), queued)
     candidates = list(db.execute(select(Revision.id, Revision.snapshot_bytes).where(
         Revision.id > state.cursor, Revision.id <= state.watermark, Revision.observed_at <= batch.cutoff,
         recent, ~later).order_by(Revision.id).limit(100)))
@@ -136,37 +149,90 @@ def prepare_step(db, batch, state):
         new = revision.published_at and start <= revision.published_at <= batch.cutoff and not prior
         important = (revision.important_at and start <= revision.important_at <= batch.cutoff
                      and (not old or not old.important_at or revision.important_at > old.important_at))
-        if new or important:
-            category = "new" if new else "update"
-            facts = dict(revision.snapshot)
-            facts["report_category"] = category
-            item = BatchItem(batch_id=batch.id, vulnerability_id=revision.vulnerability_id,
-                             snapshot=facts, priority=True)
-            db.add(item)
-            db.flush()
-            risk = {"unknown": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
-            db.add(ReportSelection(item_id=item.id, revision_id=revision.id,
-                                   group_name=facts.get("product_group", "其他产品／待确认"),
-                                   rank=(10 if facts.get("exploited") else 0) + risk.get(facts.get("severity"), 0),
-                                   category=category))
-            state.total += 1
-            if new:
-                state.new_count += 1
+        backlog = db.get(ReportBacklog, revision.vulnerability_id)
+        # Later authoritative evidence can invalidate an earlier "new" date.
+        # Persistence is for qualified overflow, not for preserving a disproved
+        # disclosure classification forever.
+        if (backlog and backlog.category == "new" and revision.published_at
+                and revision.published_at < backlog.first_eligible_at - timedelta(days=7)):
+            if revision.important_at and revision.important_at >= backlog.first_eligible_at - timedelta(days=7):
+                backlog.category = "update"
             else:
-                state.update_count += 1
-        elif revision.published_at is None:
+                from .service import audit
+                audit(db, "report-worker", "backlog.disclosure_invalidated", revision.vulnerability_id)
+                db.delete(backlog)
+                backlog = None
+        if revision.published_at is None:
             db.add(UnverifiedItem(batch_id=batch.id, revision_id=revision.id,
                                  title=revision.snapshot["title"],
                                  identifiers=", ".join(revision.snapshot.get("aliases", [])),
                                  references=revision.snapshot.get("references", [])))
             state.unknown_count += 1
+        elif new or important or (backlog and (old is None or revision.id > old.id)):
+            risk = {"unknown": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+            facts = revision.snapshot
+            rank = (10 if facts.get("exploited") else 0) + risk.get(facts.get("severity"), 0)
+            if backlog is None:
+                db.add(ReportBacklog(vulnerability_id=revision.vulnerability_id, revision_id=revision.id,
+                                    first_eligible_at=batch.cutoff, category="new" if new else "update", rank=rank))
+            elif revision.id >= backlog.revision_id:
+                backlog.revision_id, backlog.rank = revision.id, rank
+            db.add(ReportCandidate(batch_id=batch.id, vulnerability_id=revision.vulnerability_id,
+                                   revision_id=revision.id,
+                                   first_eligible_at=backlog.first_eligible_at if backlog else batch.cutoff,
+                                   category=backlog.category if backlog else "new" if new else "update", rank=rank))
         state.cursor = identity
         used += byte_count
         db.flush()
         db.expunge(revision)
     if not candidates:
-        state.work = {**state.work, "prepared": True, "phase": "analyzing"}
+        count = db.scalar(select(func.count()).select_from(ReportCandidate).where(ReportCandidate.batch_id == batch.id))
+        state.work = {**state.work, "phase": "select", "candidate_total": count}
+
+
+def select_step(db, batch, state):
+    """Freeze the highest priority candidates only after the full scan has finished."""
+    from .config import settings
+    limit = state.work.get("item_limit", settings().report_max_items)
+    selected = select(BatchItem.vulnerability_id).where(BatchItem.batch_id == batch.id)
+    rows = list(db.scalars(select(ReportCandidate).where(ReportCandidate.batch_id == batch.id,
+        ReportCandidate.vulnerability_id.not_in(selected))
+        .order_by(ReportCandidate.rank.desc(), ReportCandidate.first_eligible_at,
+                  ReportCandidate.vulnerability_id).limit(min(10, max(0, limit - state.total)))))
+    used = 0
+    work = dict(state.work)
+    for candidate in rows:
+        revision = db.get(Revision, candidate.revision_id)
+        if used and used + revision.snapshot_bytes > 2_000_000:
+            break
+        start = batch.cutoff - timedelta(days=7)
+        event_at = revision.published_at if candidate.category == "new" else revision.important_at
+        is_backlog = candidate.first_eligible_at < start or not event_at or event_at < start
+        facts = {**revision.snapshot, "report_category": candidate.category,
+                 "report_backlog": is_backlog, "first_eligible_at": iso(candidate.first_eligible_at)}
+        item = BatchItem(batch_id=batch.id, vulnerability_id=candidate.vulnerability_id, snapshot=facts, priority=True)
+        db.add(item)
+        db.flush()
+        db.add(ReportSelection(item_id=item.id, revision_id=revision.id,
+                               group_name=facts.get("product_group", "其他产品／待确认"),
+                               rank=candidate.rank, category=candidate.category))
+        state.total += 1
+        if candidate.category == "new":
+            state.new_count += 1
+        else:
+            state.update_count += 1
+        work["backlog_selected"] = work.get("backlog_selected", 0) + int(is_backlog)
+        if is_backlog:
+            key = "backlog_new" if candidate.category == "new" else "backlog_updates"
+            work[key] = work.get(key, 0) + 1
+        used += revision.snapshot_bytes
+        db.flush()
+        db.expunge(revision)
+    if not rows or state.total >= limit:
+        db.execute(delete(ReportCandidate).where(ReportCandidate.batch_id == batch.id))
+        work.update(prepared=True, phase="analyzing", deferred_count=max(0, work["candidate_total"] - state.total))
         batch.status = "analyzing"
+    state.work = work
 
 
 def batch_page(db, batch_id, after=0, limit=10, pending_only=False):
@@ -180,7 +246,8 @@ def batch_page(db, batch_id, after=0, limit=10, pending_only=False):
         return {**result, "coverage": batch.coverage, "items": [], "next_after": None,
                 "note": "批次正在准备；尚不能判断是否无记录，请稍后查询"}
     columns = [BatchItem.id, BatchItem.priority, BatchItem.analysis]
-    names = ["aliases", "severity", "exploited", "product_group", "timeline", "report_category", "mentioned_cves"]
+    names = ["aliases", "severity", "exploited", "product_group", "timeline", "report_category", "mentioned_cves",
+             "report_backlog", "first_eligible_at"]
     columns += [BatchItem.snapshot[name].label(name) for name in names]
     title_column = BatchItem.snapshot["title"].as_string()
     columns += [func.substr(title_column, 1, 500).label("title"), func.length(title_column).label("title_length")]
@@ -226,6 +293,8 @@ def item_evidence(db, batch_id, item_id, offset=0, limit=16000):
 
 
 def finalize(db, actor, batch_id, summary="", overview=None):
+    from .maintenance import report_write_guard
+    report_write_guard(db)
     from .service import audit
     batch = db.scalar(select(Batch).where(Batch.id == batch_id).with_for_update())
     if batch is None:
@@ -266,6 +335,9 @@ def run_report_once():
     """One short lease and checkpoint transaction, also safe at committed collector boundaries."""
     started = time.monotonic()
     with session() as db:
+        from .maintenance import active
+        if active(db):
+            return False
         stale = db.scalars(select(Job).where(Job.kind == "report", Job.status == "running",
                                             Job.lease_until < now()))
         for job in stale:
@@ -285,9 +357,9 @@ def run_report_once():
             if not batch or not state:
                 raise ValueError("报告任务缺少持久化状态")
             if batch.status == "failed":
-                batch.status = "preparing" if state.work["phase"] == "prepare" else "rendering"
+                batch.status = "preparing" if state.work["phase"] in {"prepare", "select"} else "rendering"
                 batch.error = None
-            if state.work["phase"] == "prepare":
+            if state.work["phase"] in {"prepare", "select"}:
                 prepare_step(db, batch, state)
             elif state.work["phase"] not in {"analyzing", "complete"}:
                 from .report_render import render_step

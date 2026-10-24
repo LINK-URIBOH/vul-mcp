@@ -27,6 +27,7 @@ STATUS_LABELS = {"critical": "严重", "high": "高危", "medium": "中危", "lo
                  "running": "运行中", "done": "完成", "analyzing": "分析中", "finalized": "已归档",
                  "preparing": "准备中", "rendering": "生成文件中", "staged": "待统一发布",
                  "email": "邮件", "webhook": "Webhook"}
+STATUS_LABELS.update(maintenance="历史修复", interrupted="已中断／等待恢复")
 TEMPLATES.filters["statuslabel"] = lambda value: STATUS_LABELS.get(value, value) if isinstance(value, str) else value
 
 
@@ -219,9 +220,11 @@ async def report_detail(request):
             BatchItem.batch_id == batch.id, BatchItem.priority.is_(True), BatchItem.analysis.is_(None)))
         state = db.get(ReportState, batch.id)
         from .report_jobs import status as report_status
+        from .report_content import scope_text
         progress = report_status(db, batch)
         return page(request, identity, "报告 · " + batch.slot,
-                    summary=(f"近期公开 {state.new_count} 条；重要更新 {state.update_count} 条；日期待核实 {state.unknown_count} 条。" if state else "旧规则历史报告，保留原始归档。"),
+                    summary=((scope_text(state) + f" 公开日期待核实 {state.unknown_count} 条。" if progress["ready"] else
+                              "正在准备候选与冻结证据，尚不能判断为空报告。") if state else "旧规则历史报告，保留原始归档。"),
                     diagnostic_summary=batch.summary,
                     report_view=f"/admin/reports/{batch.id}/view" if batch.status == "finalized" else None,
                     detail=f"状态：{STATUS_LABELS.get(batch.status, batch.status)}；总数：{progress.get('total', '未知')}；待逐条分析：{progress.get('pending_analysis', pending)}。{batch.error or ''} 未完成批次可继续恢复。",
@@ -283,9 +286,15 @@ async def tasks(request):
         offset = offset_page(request)
         jobs = list(db.scalars(select(Job).order_by(Job.created_at.desc()).offset(offset).limit(101)))
         events = list(db.scalars(select(Audit).order_by(Audit.id.desc()).limit(30)))
+        from .maintenance import progress
+        maintenance = progress(db)
         return page(request, identity, "任务与操作记录", columns=["任务", "来源", "状态", "创建时间（UTC）", "错误"],
-                    rows=[{"cells": [j.kind, j.source_id or "—", j.status, j.created_at, j.error or "—"],
-                           "actions": [{"label": "重试", "url": f"/admin/actions/job/{j.id}/retry"}] if j.status == "failed" else []}
+                    maintenance=maintenance,
+                    rows=[{"cells": [j.kind, j.source_id or "—",
+                                     maintenance["status"] if j.kind == "maintenance" and maintenance and j.id == maintenance["job_id"] else j.status,
+                                     j.created_at, j.error or "—"],
+                           "actions": [{"label": "重试", "url": f"/admin/actions/job/{j.id}/retry"}]
+                           if j.status == "failed" and j.kind != "maintenance" else []}
                           for j in jobs[:100]], events=events,
                     next_url=f"?offset={offset + 100}" if len(jobs) > 100 else None)
 
@@ -315,6 +324,9 @@ async def action(request):
         if not secrets.compare_digest(str(form.get("csrf", "")), identity.csrf):
             raise HTTPException(403, "表单已过期，请刷新后重试")
         kind, target, operation = (request.path_params[k] for k in ("kind", "target", "operation"))
+        from .maintenance import BLOCKED, active
+        if active(db):
+            raise HTTPException(409, BLOCKED)
         if kind == "source":
             obj = db.get(Source, target)
             if not obj:
@@ -333,6 +345,8 @@ async def action(request):
             obj = db.get(cls, target)
             if not obj or obj.status != "failed":
                 raise HTTPException(409, "仅可重试失败记录，成功记录不会重发")
+            if kind == "job" and obj.kind == "maintenance":
+                raise HTTPException(409, "请使用 repair-history --clear-reports 恢复维护任务")
             obj.status, obj.error, obj.lease_until = "pending", None, None
             if kind == "delivery":
                 obj.attempts, obj.next_run = 0, now()

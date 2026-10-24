@@ -14,6 +14,29 @@ ESC = html.escape
 FONT = "'Microsoft YaHei','PingFang SC','Noto Sans CJK SC',sans-serif"
 
 
+def report_scope(state):
+    work = state.work
+    return {"item_limit": work.get("item_limit"), "candidate_total": work.get("candidate_total", state.total),
+            "deferred_count": work.get("deferred_count", 0), "backlog_selected": work.get("backlog_selected", 0),
+            "current_new_disclosures": state.new_count - work.get("backlog_new", 0),
+            "recent_important_updates": state.update_count - work.get("backlog_updates", 0)}
+
+
+def scope_text(state):
+    scope = report_scope(state)
+    return (f'本批次合格候选 {scope["candidate_total"]} 条，详细分析 {state.total} 条'
+            + (f'（上限 {scope["item_limit"]} 条）' if scope["item_limit"] is not None else '')
+            + f'：本期公开 {scope["current_new_disclosures"]} 条，近期重要更新 {scope["recent_important_updates"]} 条，'
+            f'积压补报 {scope["backlog_selected"]} 条。另有 {scope["deferred_count"]} 条持久待报，未计为已覆盖。')
+
+
+def category_label(facts):
+    category = "近期公开" if facts.get("report_category") == "new" else "重要更新"
+    if facts.get("report_backlog"):
+        category = "积压补报（" + ("首次公开" if facts.get("report_category") == "new" else "重要变化") + "）"
+    return category
+
+
 def label_time(value, precision=None):
     from .timeline import stamp
     parsed = stamp(value)
@@ -48,10 +71,9 @@ def header(batch, state):
               f'<p style="font-size:12px;color:#50677a;overflow-wrap:anywhere">报告编号：{ESC(batch.id)}</p>'
               f'<p><a style="color:#174b76" href="{ESC(settings().public_base_url)}/admin/reports/{ESC(batch.id)}/view">阅读网页版完整报告</a></p></header>'
               '<!--VOLUME--><section><h2 style="font-size:20px">风险概览</h2>'
-              f'<p>本报告逐条详解 <strong>{state.total}</strong> 条：近期公开 {state.new_count} 条，'
-              f'重要更新 {state.update_count} 条。另有 {state.unknown_count} 条公开日期待核实，未混入近期公开。</p>'
-              f'<p style="font-size:13px;color:#50677a">首次补报公开窗口：{ESC(label_time(start))} 至 {ESC(label_time(batch.cutoff))}。'
-              '后续仅报告未覆盖记录和重要变化。</p>')
+              f'<p>{ESC(scope_text(state))}</p><p>另有 {state.unknown_count} 条公开日期待核实，未混入近期公开。</p>'
+              f'<p style="font-size:13px;color:#50677a">本期筛选窗口：{ESC(label_time(start))} 至 {ESC(label_time(batch.cutoff))}。'
+              '积压补报可早于此窗口，其原始时间和首次待报时间逐条列示。</p>')
     for key, label in [("risk_summary", "核心风险"), ("repair_priorities", "优先修复建议")]:
         bullets = overview.get(key, [])
         if bullets:
@@ -67,7 +89,7 @@ def article(item):
     identifiers = ", ".join(facts.get("aliases", [])) or "暂无公开编号"
     if facts.get("mentioned_cves"):
         identifiers += "；关联 CVE（非别名）：" + ", ".join(facts["mentioned_cves"])
-    category = "近期公开" if facts.get("report_category") == "new" else "重要更新"
+    category = category_label(facts)
     timeline = facts.get("timeline", {})
     result = (f'<article id="item-{item.id}" style="padding:18px 0;border-bottom:1px solid #cad5df;break-inside:avoid">'
               f'<h3 style="font-size:20px;margin:6px 0;overflow-wrap:anywhere">{text(facts["title"])}</h3>'
@@ -76,7 +98,8 @@ def article(item):
               f'<p style="font-size:13px;color:#50677a">公开时间：{ESC(label_time(timeline.get("published_at"), timeline.get("publication_precision")))}<br>'
               f'时间依据：{text(timeline.get("publication_basis"))}；来源：{text(timeline.get("publication_source"))}<br>'
               f'上游更新时间：{ESC(label_time(timeline.get("upstream_updated_at")))}<br>'
-              f'重要变化时间：{ESC(label_time(timeline.get("material_changed_at")))}；依据：{text(timeline.get("change_basis"))}</p>')
+              f'重要变化时间：{ESC(label_time(timeline.get("material_changed_at")))}；依据：{text(timeline.get("change_basis"))}<br>'
+              f'首次待报时间：{ESC(label_time(facts.get("first_eligible_at")))}</p>')
     for field, label in FIELDS.items():
         value = analysis.get(field) or "未公开／未确认"
         if field == "evidence_level":
@@ -90,6 +113,7 @@ def markdown_article(item):
     facts, analysis = item.snapshot, item.analysis or {}
     result = f'### {ESC(facts["title"])}\n\n编号：{ESC(", ".join(facts.get("aliases", [])))}\n\n'
     result += f'严重性：{SEVERITY.get(facts.get("severity"), "未评分")}；已利用：{"是" if facts.get("exploited") else "未确认"}\n\n'
+    result += f'类别：{category_label(facts)}；首次待报时间：{label_time(facts.get("first_eligible_at"))}\n\n'
     timeline = facts.get("timeline", {})
     result += f'公开时间：{label_time(timeline.get("published_at"), timeline.get("publication_precision"))}；时间依据：{ESC(timeline.get("publication_basis", "未确认"))}\n\n'
     result += f'上游更新时间：{label_time(timeline.get("upstream_updated_at"))}\n\n'

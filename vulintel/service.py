@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete, select, update
 
-from .db import (Alias, Audit, Batch, BatchItem, Delivery, MetadataState, ReportState, Revision,
+from .db import (Alias, Audit, Batch, BatchItem, Delivery, MetadataState, ReportBacklog, ReportState, Revision,
                  Source, SourceRecord, Vulnerability, now, uid)
 from .sources import RANK
 from .identity import record_aliases
@@ -22,14 +22,14 @@ def audit(db, actor, action, target):
     db.add(Audit(actor=actor[:200], action=action, target=str(target)[:200]))
 
 
-def ingest(db, source_id, data):
+def ingest(db, source_id, data, *, maintenance=False):
     """Idempotent source records; aliases link CVEs, never a bulletin's mentioned CVEs."""
     data = {**data, "aliases": record_aliases(data)}
     source_key = data["source_key"][:240]
     record = db.scalar(select(SourceRecord).where(SourceRecord.source_id == source_id,
                                                 SourceRecord.source_key == source_key))
     fingerprint = digest({k: v for k, v in data.items() if k not in {"modified"}})
-    if record and record.fingerprint == fingerprint:
+    if record and record.fingerprint == fingerprint and not maintenance:
         return record.vulnerability_id
     aliases = sorted(set([str(a).upper() for a in data.get("aliases", [])] or [f"{source_id}:{source_key}".upper()]))
     ids = list(db.scalars(select(Alias.vulnerability_id).where(Alias.alias.in_(aliases)).distinct()))
@@ -40,6 +40,18 @@ def ingest(db, source_id, data):
         vuln = db.get(Vulnerability, ids[0])
         # Late alias bridging can merge previously separate source entities.
         for other in ids[1:]:
+            pending = db.get(ReportBacklog, other)
+            if pending:
+                current = db.get(ReportBacklog, vuln.id)
+                if current:
+                    current.first_eligible_at = min(current.first_eligible_at, pending.first_eligible_at)
+                    current.category = "new" if "new" in {current.category, pending.category} else "update"
+                    if pending.revision_id > current.revision_id:
+                        current.revision_id, current.rank = pending.revision_id, pending.rank
+                    db.delete(pending)
+                else:
+                    pending.vulnerability_id = vuln.id
+                db.flush()
             db.execute(update(Alias).where(Alias.vulnerability_id == other).values(vulnerability_id=vuln.id))
             db.execute(update(SourceRecord).where(SourceRecord.vulnerability_id == other).values(vulnerability_id=vuln.id))
             db.execute(update(Revision).where(Revision.vulnerability_id == other).values(vulnerability_id=vuln.id))
@@ -61,7 +73,7 @@ def ingest(db, source_id, data):
     db.flush()
     records = list(db.scalars(select(SourceRecord).where(SourceRecord.vulnerability_id == vuln.id)))
     # Rich structured records precede KEV; all source facts remain inspectable.
-    ordered = sorted(records, key=lambda r: (r.source_id == "kev", r.source_id.startswith("osv-"), r.source_id))
+    ordered = sorted(records, key=lambda r: (r.source_id == "kev", r.source_id.startswith("osv-"), r.source_id, r.source_key))
     main = ordered[0].data
     all_aliases = sorted(db.scalars(select(Alias.alias).where(Alias.vulnerability_id == vuln.id)))
     severity = max((r.data.get("severity", "unknown") for r in records), key=lambda s: RANK.get(s, 0))
@@ -74,9 +86,15 @@ def ingest(db, source_id, data):
     vuln.title = main["title"]
     vuln.product = " ".join(sorted({json.dumps(r.data.get("affected", []), ensure_ascii=False) for r in records}))
     vuln.severity, vuln.exploited = severity, merged["exploited"]
-    vuln.updated_at = now()
-    from .timeline import append_revision
-    append_revision(db, vuln, previous=previous)
+    if not maintenance:
+        vuln.updated_at = now()
+        from .timeline import append_revision
+        revision = append_revision(db, vuln, previous=previous)
+        pending = db.get(ReportBacklog, vuln.id)
+        if pending:
+            db.flush()
+            pending.revision_id = revision.id
+            pending.rank = (10 if merged.get("exploited") else 0) + RANK.get(severity, 0)
     return vuln.id
 
 
@@ -158,6 +176,8 @@ class Overview(BaseModel):
 
 
 def submit_analysis(db, actor, batch_id, analyses):
+    from .maintenance import report_write_guard
+    report_write_guard(db)
     batch = db.scalar(select(Batch).where(Batch.id == batch_id).with_for_update())
     if not batch or batch.status == "finalized":
         raise ValueError("批次不存在或已经归档")

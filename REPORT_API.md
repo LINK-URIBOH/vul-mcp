@@ -4,7 +4,15 @@
 
 批次状态为 preparing、analyzing、rendering、finalized、failed。仅 finalized 可下载正式文件。get_report_status 返回 policy、ready、total、analyzed、pending_analysis、new_disclosures、important_updates、unverified_dates、metadata_backfill、phase、render_stage、rendered_items、coverage_at_utc、error；准备前未知计数为 null，不是零。
 
-旧批次 policy=1、legacy=true，只读保留，不自动覆盖或重新投递。v1.1.0 规则为 policy=2，v1.1.1 新批次为 policy=3，时间段仍唯一。未完成新批次优先恢复；下一个报告不会跳过未完成分析。旧事件策略冻结批次增加 event_audit_required=true，升级不会自动清空或重选该批次；先使用 CLI audit-report 核对重复与公开日期。
+旧批次 policy=1、legacy=true，v1.1.0 为 policy=2，v1.1.1 为 policy=3，v1.2.0 新批次为 policy=4，时间段仍唯一。未完成批次优先恢复，升级本身不清理或重选旧批次；显式运行 `repair-history --clear-reports` 时清理该维护首次启动前的全部旧报告、分析、投递及归档，然后重新筛选。工具完成后再次运行不会删除新报告。旧策略仍存在时返回 event_audit_required=true。
+
+v1.2.0 默认每批最多50条详细分析（REPORT_MAX_ITEMS，批次创建时冻结）。完整扫描候选后按已利用、严重性、首次待报时间及稳定编号选择；超额条目持久待报，超过七天以积压补报展示。归档成功才确认覆盖，冻结之后的新证据继续待报。未知公开日期单列，不占50条分析额度。
+
+`get_report_status` 新增 `item_limit`、`candidate_total`、`deferred_count`、`backlog_selected`；候选扫描尚未完成时候选/延期数可为null。`get_batch_page` 和完整事实增加 `report_backlog`、`first_eligible_at`，以区分当前窗口与历史积压。
+
+原 `new_disclosures`、`important_updates` 保留按原始类别计数（可包含积压）；新增 `current_new_disclosures`、`recent_important_updates` 排除积压，与 `backlog_selected` 合计等于本批详细分析总数。归档 JSON、Webhook 的 `report_scope` 和邮件正文使用相同覆盖口径。
+
+`health_check` 新增 `maintenance`（未运行过时为null），包含阶段、任务状态、心跳及前后数量。维护状态持久保存，未完成（包括中断、失败）时拒绝报告创建、分析提交和完成，并暂停后台报告、投递及采集。通过服务器相同维护命令恢复。九个MCP工具的名称和权限不变。
 
 timeline.event_policy=3 区分 source_publications（来源条目公开时间与作用范围）和 published_at（有公开依据的漏洞/公告公开时间）。Debian/Ubuntu OSV 条目 published 不再直接作为漏洞公开时间；无其他日期依据时保持未知。零值日期不作为事件；changed_fields 记录真正变化字段。数据库工具、权限和九个 MCP 工具数量保持不变。
 
