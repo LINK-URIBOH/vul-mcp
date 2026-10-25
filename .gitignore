@@ -3,6 +3,7 @@ secrets/
 .venv/
 __pycache__/
 .pytest_cache/
+.test-tmp-*/
 .ruff_cache/
 *.pyc
 *.png

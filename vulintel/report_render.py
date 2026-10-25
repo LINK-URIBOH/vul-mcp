@@ -10,7 +10,7 @@ from sqlalchemy import and_, delete, or_, select, update
 from .config import settings
 from .db import BatchItem, Delivery, PublicationAnnotation, ReportBacklog, ReportSelection, Revision, UnverifiedItem, uid
 from .report_content import (ESC, FONT, SEVERITY, article, category_label, coverage, header, markdown_article,
-                             references, report_scope, scope_text)
+                             references, report_scope, scope_text, display_facts)
 from .reports import csv_safe, export_item, report_dir
 from .timeline import iso
 
@@ -50,7 +50,7 @@ def rows_after(db, batch_id, cursor, limit=25):
 def save_webhook(db, batch, state, work, values):
     identity = uid()
     number = work.get("webhook_parts", 0) + 1
-    payload = {"schema_version": "2.0", "message_id": identity, "report_id": batch.id, "slot": batch.slot,
+    payload = {"schema_version": "2.0", "message_id": identity, "report_id": batch.id, "slot": state.work.get("logical_slot", batch.slot),
                "part": number, "parts": 0, "summary": scope_text(state), "report_scope": report_scope(state),
                "coverage": batch.coverage, "overview": state.overview, "items": values,
                "raw_evidence": "完整原始事实见归档 report.json；本消息包含有界事实和完整分析"}
@@ -96,22 +96,22 @@ def render_step(db, batch, state):
     root.mkdir(parents=True, exist_ok=True)
     outer = dict(state.work)
     work = json.loads(json.dumps(outer.get("render", {})))
-    channels = work.setdefault("channels", list(settings().delivery_channels))
+    channels = work.setdefault("channels", [] if outer.get("archive_only") else list(settings().delivery_channels))
     # Freeze destinations' channel set for this publication; removed channels stay paused in worker.
-    columns = csv_row(["编号", "标题", "产品", "严重性", "类别", "公开时间", "公开时间依据", "日期状态", "日期精度", "日期原始值", "日期标注版本", "日期证据地址", "参考来源"])
-    unknown_columns = csv_row(["编号", "标题", "原因", "原始修订编号", "参考来源"])
+    columns = csv_row(["编号", "标题", "产品", "严重性", "类别", "公开时间", "公开时间依据", "日期状态", "日期精度", "日期原始值", "日期标注版本", "日期证据地址", "参考来源", "展示完整性"])
+    unknown_columns = csv_row(["编号", "标题", "原因", "原始修订编号", "参考来源", "展示完整性"])
     phase = work.setdefault("phase", "details")
     if not work.get("started"):
         append(root, work, "report.html", '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>漏洞情报报告</title>'
                f'<style>body{{margin:0;background:#f4f7fa;font-family:{FONT}}}p,li{{overflow-wrap:anywhere}} @media(max-width:600px){{h1{{font-size:23px}}}}</style></head><body>' + header(batch, state) + "<h2>漏洞详情</h2>")
-        append(root, work, "report.md", f"# 漏洞情报报告\n\n报告编号：{batch.id}\n\n时间段：{batch.slot}\n\n{scope_text(state)}\n\n公开日期待核实 {state.unknown_count} 条。\n\n")
+        append(root, work, "report.md", f"# 漏洞情报报告\n\n报告编号：{batch.id}\n\n时间段：{outer.get('logical_slot', batch.slot)}\n\n{scope_text(state)}\n\n公开日期待核实 {state.unknown_count} 条。\n\n")
         bootstrap = state.work.get("bootstrap")
         if bootstrap:
             append(root, work, "report.md", f'分阶段采集：暂存候选待核实 {bootstrap["unverified"]} 条、日期冲突 {bootstrap["conflicts"]} 条、待补证 {bootstrap["pending"]} 条、超大待核查 {bootstrap.get("oversized", 0)} 条；独立于正式库和本批合格候选。定向来源覆盖有限，不代表全部来源已扫描。候选核实清单见管理页。\n\n')
         for key, label in [("risk_summary", "核心风险"), ("repair_priorities", "优先修复建议")]:
             if state.overview.get(key):
                 append(root, work, "report.md", f"## {label}\n\n" + "".join(f"- {ESC(v)}\n" for v in state.overview[key]) + "\n")
-        metadata = {"schema_version": "2.0", "report_id": batch.id, "slot": batch.slot,
+        metadata = {"schema_version": "2.0", "report_id": batch.id, "slot": outer.get("logical_slot", batch.slot),
                     "overview": state.overview, "total": state.total, "new_disclosures": state.new_count,
                     "important_updates": state.update_count, "unknown_dates": state.unknown_count,
                     "coverage_at_utc": iso(state.coverage_at), "coverage": batch.coverage, **report_scope(state)}
@@ -136,7 +136,7 @@ def render_step(db, batch, state):
             append(root, work, "report.html", article(item))
             append(root, work, "report.md", markdown_article(item))
             append(root, work, "report.json", ("," if work.get("count") else "") + json.dumps(export_item(item), ensure_ascii=False))
-            facts = item.snapshot
+            facts = display_facts(item.snapshot)
             timeline = facts.get("timeline", {})
             line = csv_row([", ".join(facts.get("aliases", [])), facts["title"], group,
                             SEVERITY.get(facts.get("severity"), "未评分"),
@@ -145,7 +145,8 @@ def render_step(db, batch, state):
                             timeline.get("publication_status"), timeline.get("publication_precision"),
                             timeline.get("publication_original"), timeline.get("date_policy"),
                             timeline.get("publication_reference"),
-                            " ".join(sorted(set(facts.get("references", []) + facts.get("date_references", []))))])
+                            " ".join(sorted(set(facts.get("references", []) + facts.get("date_references", [])))),
+                            "字段节选，完整见report.json" if facts.get("_display_truncated") else "完整"])
             append(root, work, "index.csv", line)
             if "email" in channels:
                 mail_part(root, work, article(item), batch, state)
@@ -161,7 +162,11 @@ def render_step(db, batch, state):
                     "date_evidence", "date_conflicts", "rejected_date_evidence", "source_publications", "date_fetches", "event_dates",
                     "cve_record_publications", "source_entry_publications"}}
                 bounded["date_evidence_complete"] = False
+                bounded["display_complete"] = not facts.get("_display_truncated")
                 value = {"item_id": item.id, "facts": bounded, "analysis": item.analysis}
+                if outer.get("publication_kind") == "facts":
+                    from .report_content import fact_fields
+                    value["public_facts"] = fact_fields(facts)
                 chunk = work.get("webhook_chunk", [])
                 encoded = len(json.dumps(value, ensure_ascii=False).encode())
                 if chunk and (len(chunk) >= settings().webhook_batch_size or work.get("webhook_size", 0) + encoded > 400_000):
@@ -192,6 +197,8 @@ def render_step(db, batch, state):
         rows = rows_after(db, batch.id, work.get("cursor"), limit=100)
         for identity, group, rank, _ in rows:
             title = db.scalar(select(BatchItem.snapshot["title"]).where(BatchItem.id == identity))
+            if len(str(title)) > 500:
+                title = str(title)[:500] + "（节选，完整见report.json）"
             append(root, work, "report.html", f'<li><a href="#item-{identity}">{ESC(str(title))}</a></li>')
             append(root, work, "report.md", f'- {ESC(str(title))}\n')
             work["cursor"] = [group, rank, identity]
@@ -215,14 +222,19 @@ def render_step(db, batch, state):
             value = {"identifiers": row.identifiers, "title": row.title, "revision_id": row.revision_id,
                      "references": row.references, "reason": reason, "date_annotation_id": row.date_annotation_id,
                      "date_annotation": date_data}
-            line = csv_row([row.identifiers, row.title, reason, row.revision_id, " ".join(row.references)])
+            shown = display_facts({"title": row.title, "references": row.references})
+            identifiers = row.identifiers[:2000]
+            truncated = shown["_display_truncated"] or identifiers != row.identifiers
+            line = csv_row([identifiers, shown["title"], reason, row.revision_id, " ".join(shown["references"]),
+                            "字段节选，完整见report.json" if truncated else "完整"])
             byte_count = len(line.encode("utf-8")) + len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
             if used and used + byte_count > 2_000_000:
                 db.expunge(row)
                 break
             append(root, work, "unverified.csv", line)
-            append(root, work, "report.html", f'<li>{ESC(row.identifiers)}：{ESC(row.title)}（{ESC(reason)}）' + references(row.references) + '</li>')
-            append(root, work, "report.md", f'- {ESC(row.identifiers)}：{ESC(row.title)}（{ESC(reason)}）\n')
+            note = "；展示字段节选，完整见report.json" if truncated else ""
+            append(root, work, "report.html", f'<li>{ESC(identifiers)}：{ESC(shown["title"])}（{ESC(reason + note)}）' + references(shown["references"]) + '</li>')
+            append(root, work, "report.md", f'- {ESC(identifiers)}：{ESC(shown["title"])}（{ESC(reason + note)}）\n')
             append(root, work, "report.json", ("," if work.get("unknown_written") else "") + json.dumps(value, ensure_ascii=False))
             if "email" in channels:
                 attachment_row(root, work, line, "unverified-part", unknown_columns)
@@ -272,7 +284,7 @@ def render_step(db, batch, state):
                 attachment = root / f"index-part-{number}.csv"
             elif offset < attachment_count:
                 attachment = root / f'unverified-part-{number - work.get("index-part_parts", 0)}.csv'
-            payload = {"schema_version": "2.0", "slot": batch.slot,
+            payload = {"schema_version": "2.0", "slot": outer.get("logical_slot", batch.slot),
                        "summary": scope_text(state), "report_scope": report_scope(state),
                        "coverage": batch.coverage, "attachment": str(attachment) if attachment else None,
                        "html_body": str(root / f"email-body-{number}.html") if offset < work.get("body_parts", 0) else None,
@@ -294,14 +306,18 @@ def render_step(db, batch, state):
         if not rows:
             work["phase"] = "complete"
             batch.status, batch.error = "finalized", None
+            from .db import now
+            outer["published_at"] = iso(now())
             # Publication and coverage acknowledgement are one DB transaction.
             # Evidence learned after selection remains queued for a later batch.
-            selections = select(ReportSelection.revision_id).join(BatchItem).where(BatchItem.batch_id == batch.id)
-            db.execute(delete(ReportBacklog).where(ReportBacklog.revision_id.in_(selections)))
-            remaining = db.scalars(select(ReportBacklog).where(ReportBacklog.vulnerability_id.in_(
-                select(BatchItem.vulnerability_id).where(BatchItem.batch_id == batch.id))))
-            for candidate in remaining:
-                candidate.category = "update"
+            from .publications import acknowledge
+            if not acknowledge(db, batch, state):
+                selections = select(ReportSelection.revision_id).join(BatchItem).where(BatchItem.batch_id == batch.id)
+                db.execute(delete(ReportBacklog).where(ReportBacklog.revision_id.in_(selections)))
+                remaining = db.scalars(select(ReportBacklog).where(ReportBacklog.vulnerability_id.in_(
+                    select(BatchItem.vulnerability_id).where(BatchItem.batch_id == batch.id))))
+                for candidate in remaining:
+                    candidate.category = "update"
             db.execute(update(Delivery).where(Delivery.batch_id == batch.id, Delivery.status == "staged").values(status="pending"))
     outer["render"] = work
     outer["phase"] = "complete" if work["phase"] == "complete" else "render"

@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     source_interval_seconds: int = 3600
     delivery_max_attempts: int = 5
     report_max_items: int = Field(default=50, ge=1, le=10000)
+    publisher_enabled: bool = False
+    report_evidence_max_bytes: int = Field(default=262144, ge=16384, le=524288)
     publication_request_interval: float = Field(default=1.0, ge=0.1, le=60)
     publication_cache_hours: int = Field(default=168, ge=1, le=8760)
     publication_reference_hosts: str = ("msrc.microsoft.com,support.apple.com,source.android.com,nodejs.org,go.dev,"

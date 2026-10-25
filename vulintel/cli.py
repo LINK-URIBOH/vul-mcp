@@ -12,6 +12,10 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("init")
     commands.add_parser("status")
+    commands.add_parser("report-status", help="只读查看事实版、补充版、心跳与投递进度")
+    volumes = commands.add_parser("report-volume", help="只读统计统一公开时间口径的严重漏洞数量")
+    volumes.add_argument("--days", type=int, default=7)
+    volumes.add_argument("--severity", choices=["critical"], default="critical")
     backfill = commands.add_parser("backfill", help="分片补齐历史日期元数据，不创建报告或投递")
     backfill.add_argument("--max-steps", type=int, default=10)
     repair = commands.add_parser("repair-history", help="持续修复全部历史数据，清理旧报告；中断后同命令恢复")
@@ -33,6 +37,12 @@ def main():
     retry.add_argument("kind", choices=["job", "delivery"])
     retry.add_argument("id")
     args = parser.parse_args()
+    if args.command in {"report-status", "report-volume"}:
+        from .report_metrics import publication_progress, volume
+        with session() as db:
+            result = publication_progress(db) if args.command == "report-status" else volume(db, args.days, args.severity)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
     if args.command == "audit-report":
         from .event_audit import audit_report
         if args.snapshot_json:

@@ -1,6 +1,6 @@
 [project]
 name = "vul-intel"
-version = "1.4.1"
+version = "1.5.0"
 description = "Cloud MCP vulnerability intelligence service"
 requires-python = ">=3.12,<3.13"
 dependencies = [

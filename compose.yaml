@@ -1,12 +1,14 @@
 name: vul-intel
 x-app: &app
-  image: vul-intel:1.4.1
+  image: vul-intel:1.5.0
   env_file: .env
   environment:
     DATABASE_URL: postgresql+psycopg://vul:${VUL_DB_PASSWORD:?run bootstrap}@db/vul
     KEYCLOAK_INTERNAL_URL: http://keycloak:8080/auth/realms/vul
     DATA_DIR: /data
     REPORT_MAX_ITEMS: ${REPORT_MAX_ITEMS:-50}
+    PUBLISHER_ENABLED: "true"
+    REPORT_EVIDENCE_MAX_BYTES: ${REPORT_EVIDENCE_MAX_BYTES:-262144}
     PUBLICATION_REQUEST_INTERVAL: ${PUBLICATION_REQUEST_INTERVAL:-1.0}
     PUBLICATION_CACHE_HOURS: ${PUBLICATION_CACHE_HOURS:-168}
   restart: unless-stopped
@@ -101,6 +103,17 @@ services:
       interval: 60s
       timeout: 5s
       start_period: 120s
+      retries: 3
+  publisher:
+    <<: *app
+    command: [python, -m, vulintel.publisher]
+    mem_limit: 384m
+    cpus: 0.5
+    healthcheck:
+      test: [CMD, python, -c, "import pathlib,time; p=pathlib.Path('/data/publisher.heartbeat'); assert p.exists() and time.time()-p.stat().st_mtime < 120"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
       retries: 3
 volumes:
   postgres:

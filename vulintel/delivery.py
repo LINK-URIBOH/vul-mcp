@@ -47,7 +47,9 @@ def email_message(delivery):
     cfg = settings()
     payload = delivery.payload
     message = EmailMessage()
-    message["Subject"] = f"漏洞情报 {payload['slot']} [{delivery.part}/{payload['parts']}]"
+    from .publications import LABELS
+    label = LABELS.get(payload.get("report_scope", {}).get("report_kind"), "")
+    message["Subject"] = f"漏洞情报 {label} {payload['slot']} [{delivery.part}/{payload['parts']}]"
     message["From"] = cfg.smtp_from
     message["To"] = cfg.smtp_to
     message["Message-ID"] = f"<{delivery.id}@{cfg.public_base_url.split('//')[1]}>"

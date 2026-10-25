@@ -27,6 +27,8 @@ def touch_heartbeat():
 def tick_delivery():
     global last_date_tick
     touch_heartbeat()
+    if settings().publisher_enabled:
+        return False
     from .report_jobs import run_report_once
     report_busy = run_report_once()
     with session() as db:
@@ -101,7 +103,10 @@ def main():
             raise RuntimeError("Another worker already owns the collector lock")
         lock.commit()
     with session() as db:
-        for interrupted in db.scalars(select(Job).where(Job.status == "running", Job.kind != "maintenance")):
+        query = select(Job).where(Job.status == "running", Job.kind != "maintenance")
+        if settings().publisher_enabled:
+            query = query.where(Job.kind != "report")
+        for interrupted in db.scalars(query):
             interrupted.status = "pending" if interrupted.kind in {"report", "publication", "bootstrap"} else "failed"
             interrupted.lease_until = None
             interrupted.error = None if interrupted.kind in {"report", "publication"} else "上次工作进程中断，请重试"

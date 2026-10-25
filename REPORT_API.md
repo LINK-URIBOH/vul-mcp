@@ -1,5 +1,22 @@
 # 报告工作流接口
 
+## 1.5.0新增接口（九工具不变）
+
+- `open_report_batch(slot=null,ensure_facts=false,progressive=false)`：新模式需两项true，验证提交及投递权限，原子保存当前slot事实任务并返回`fact_report.report_id/slot`及可恢复的`batch_id/slot`。工具声明投递副作用；不支持绕过人工批准。
+- `get_batch_page(...,include_evidence=true,limit=50,max_bytes=262144)`：按预算返回完整冻结JSON；`evidence_complete=false`必须按`get_item_evidence`续页。旧摘要模式上限20不变。超大记录先读SQL长度，不一次加载50条大JSON。
+
+完整证据预算同时计入MCP文本和结构化副本、文本缩进及转义，并预留协议余量，不仅计算逻辑JSON大小。
+- `submit_batch_analysis`仍最多10条，另限制总内容768KiB。渐进发布已认领的分析不能覆盖，其他项保持待分析。
+- `finalize_report(...,mode="supplement")`：仅释放已授权批次保存的剩余详解；默认complete仍要求全分析。后台每10条补发，尾数最后保存15分钟后补发，全部完成后仅归档汇总。
+- `get_report_status/get_delivery_status(batch_id,fact_report_id=null)`：区分当前事实版、详解补充版、完整汇总及各自渠道状态；恢复旧批次时应显式传当前事实报告编号。
+- `get_source_status(include_volume=true)`：可选返回正式库规范日期、统一标识去重的critical统计；来源缺口、待核实和覆盖有限时`complete=false`。
+
+发布记录复用受控UUID归档Batch与现有分卷Delivery；`report_publications`记录类型、逻辑slot、父事实版、触发和期限，`publication_claims`冻结分析，`publication_receipts`在归档成功事务中分别确认facts/detail覆盖。内部`pub:UUID`不是可调用的时间段；所有对外时间使用逻辑slot。只有MCP触发能创建当期事实任务，publisher不会自行按日历补建时段。
+
+HTML、Markdown、CSV和邮件对超长标题、别名列表与引用作有界展示，并明确标注节选；原始事实始终完整保存在report.json，不因展示预算丢弃入选记录。CSV增加末列“展示完整性”，旧列顺序不变。
+
+新模式会明确剔除非critical，未知评级另计；日期缺失／冲突不阻塞其他已核实项。旧工具默认参数维持旧模式兼容，生产任务应替换为1.5.0提示词并开启新模式。归档完成不代表渠道送达。
+
 ## 服务器状态
 
 v1.4.1无需数据库迁移。`bootstrap.oversized`和各来源oversized/oversized_candidates表示超过8MiB、原文完整保存但尚待核查的候选，不是已分析数或已核实新增。来源coverage_limited和coverage_note说明此类缺口；扫描可以完成，隔离项仍保留。管理页增加oversized筛选及管理员原文下载。旧报告冻结快照缺少新字段时按0兼容。

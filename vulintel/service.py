@@ -42,6 +42,15 @@ def ingest(db, source_id, data, *, maintenance=False, observed=None):
         vuln = db.get(Vulnerability, ids[0])
         # Late alias bridging can merge previously separate source entities.
         for other in ids[1:]:
+            from .db import PublicationReceipt
+            for receipt in db.scalars(select(PublicationReceipt).where(PublicationReceipt.vulnerability_id == other)):
+                duplicate = db.scalar(select(PublicationReceipt.id).where(PublicationReceipt.vulnerability_id == vuln.id,
+                    PublicationReceipt.kind == receipt.kind, PublicationReceipt.event_key == receipt.event_key))
+                if duplicate:
+                    db.delete(receipt)
+                else:
+                    receipt.vulnerability_id = vuln.id
+                db.flush()
             from .db import PublicationAnnotation, PublicationState
             db.execute(update(PublicationAnnotation).where(PublicationAnnotation.vulnerability_id == other)
                        .values(vulnerability_id=vuln.id))
@@ -86,6 +95,9 @@ def ingest(db, source_id, data, *, maintenance=False, observed=None):
     all_aliases = sorted(db.scalars(select(Alias.alias).where(Alias.vulnerability_id == vuln.id)))
     severity = max((r.data.get("severity", "unknown") for r in records), key=lambda s: RANK.get(s, 0))
     merged = {**main, "id": vuln.id, "aliases": all_aliases, "severity": severity,
+              "severity_conflict": len({r.data.get("severity") for r in records if r.data.get("severity") in {"low", "medium", "high", "critical"}}) > 1,
+              "severity_evidence": [{"source": r.source_id, "rating": r.data.get("severity_evidence"),
+                                     "ratings": r.data.get("severity_ratings")} for r in records],
               "exploited": any(r.data.get("exploited", False) for r in records),
               "references": sorted({url for r in records for url in r.data.get("references", [])}),
               "source_records": [{"source": r.source_id, **r.data} for r in ordered]}
@@ -156,14 +168,14 @@ def due_slot():
     return local.isoformat(timespec="minutes")
 
 
-def open_batch(db, actor, slot=None):
+def open_batch(db, actor, slot=None, ensure_facts=False, progressive=False):
     from .report_jobs import open_batch as invoke
-    return invoke(db, actor, slot)
+    return invoke(db, actor, slot, ensure_facts, progressive)
 
 
-def batch_page(db, batch_id, after=0, limit=10, pending_only=False):
+def batch_page(db, batch_id, after=0, limit=10, pending_only=False, include_evidence=False, max_bytes=262144):
     from .report_jobs import batch_page as invoke
-    return invoke(db, batch_id, after, limit, pending_only)
+    return invoke(db, batch_id, after, limit, pending_only, include_evidence, max_bytes)
 
 
 class Analysis(BaseModel):
@@ -212,6 +224,10 @@ class Overview(BaseModel):
 def submit_analysis(db, actor, batch_id, analyses):
     from .maintenance import report_write_guard
     report_write_guard(db)
+    if not 1 <= len(analyses) <= 10:
+        raise ValueError("每次仅可保存1至10条分析")
+    if len(json.dumps([a.model_dump() if isinstance(a, Analysis) else a for a in analyses], ensure_ascii=False).encode()) > 786432:
+        raise ValueError("本次分析请求超过768KiB，请减少条数")
     batch = db.scalar(select(Batch).where(Batch.id == batch_id).with_for_update())
     if not batch or batch.status == "finalized":
         raise ValueError("批次不存在或已经归档")
@@ -228,10 +244,16 @@ def submit_analysis(db, actor, batch_id, analyses):
         item = db.get(BatchItem, analysis.item_id)
         if not item or item.batch_id != batch_id:
             raise ValueError("分析引用了不属于此批次的条目")
+        from .db import PublicationClaim
+        if db.get(PublicationClaim, item.id) and item.analysis != analysis.model_dump(exclude={"item_id"}):
+            raise ValueError("详解已冻结发布，不允许覆盖；请保留原版并记录更正")
         prepared.append((item, analysis.model_dump(exclude={"item_id"})))
     for item, data in prepared:
         item.analysis = data
     batch.status, batch.error = "analyzing", None
+    if state and state.work.get("progressive"):
+        from .timeline import iso
+        state.work = {**state.work, "last_analysis_at": iso(now())}
     audit(db, actor, "batch.submit_analysis", batch_id)
     db.commit()
     return {"saved": len(prepared), "batch_id": batch_id}
@@ -245,9 +267,9 @@ def mark_batch_failed(db, actor, batch_id, error_type):
         db.commit()
 
 
-def finalize(db, actor, batch_id, summary="", overview=None):
+def finalize(db, actor, batch_id, summary="", overview=None, mode="complete"):
     from .report_jobs import finalize as invoke
-    return invoke(db, actor, batch_id, summary, overview)
+    return invoke(db, actor, batch_id, summary, overview, mode)
 
 
 def delivery_status(db, batch_id):

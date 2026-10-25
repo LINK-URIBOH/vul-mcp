@@ -17,7 +17,9 @@ FONT = "'Microsoft YaHei','PingFang SC','Noto Sans CJK SC',sans-serif"
 
 def report_scope(state):
     work = state.work
-    return {"item_limit": work.get("item_limit"), "candidate_total": work.get("candidate_total", state.total),
+    return {"report_kind": work.get("publication_kind", "analysis"), "parent_fact_id": work.get("parent_fact_id"),
+            "unknown_severity": work.get("unknown_severity", 0),
+            "item_limit": work.get("item_limit"), "candidate_total": work.get("candidate_total", state.total),
             "bootstrap": work.get("bootstrap"),
             "date_policy": work.get("date_policy"), "date_coverage": work.get("date_coverage"),
             "deferred_count": work.get("deferred_count", 0), "backlog_selected": work.get("backlog_selected", 0),
@@ -27,6 +29,13 @@ def report_scope(state):
 
 def scope_text(state):
     scope = report_scope(state)
+    if scope["report_kind"] == "facts":
+        return (f'事实版：覆盖当前已核实的全部合格严重漏洞 {state.total} 条，不受50条详解上限限制。'
+                f'尚未完成模型详解；评级未知 {scope["unknown_severity"]} 条独立待核实，不计入已核实新增。')
+    if scope["report_kind"] == "supplement":
+        return f'中文详解补充版：本次发布已完成详解 {state.total} 条；未完成项继续待分析，不代表整期详解完成。'
+    if scope["report_kind"] == "aggregate":
+        return f'完整详解汇总：本批 {state.total} 条详解已完成；内容已分批发布，本汇总仅归档。'
     return (f'本批次合格候选 {scope["candidate_total"]} 条，详细分析 {state.total} 条'
             + (f'（上限 {scope["item_limit"]} 条）' if scope["item_limit"] is not None else '')
             + f'：本期公开 {scope["current_new_disclosures"]} 条，近期重要更新 {scope["recent_important_updates"]} 条，'
@@ -68,9 +77,11 @@ def header(batch, state):
     start = batch.cutoff - timedelta(days=7)
     title = label_time(batch.cutoff.replace(tzinfo=timezone.utc).isoformat())
     overview = state.overview or {}
+    from .publications import LABELS
+    kind = LABELS.get(state.work.get("publication_kind"), "中文漏洞情报报告")
     result = (f'<div style="font-family:{FONT};color:#183047;line-height:1.75;max-width:860px;margin:0 auto;padding:20px">'
               '<header style="border-top:6px solid #173b61;padding:12px 0 18px;border-bottom:1px solid #bdcbd8">'
-              f'<h1 style="font-size:27px;margin:8px 0">漏洞情报报告</h1><p>{ESC(title)}</p>'
+              f'<h1 style="font-size:27px;margin:8px 0">漏洞情报报告 · {ESC(kind)}</h1><p>{ESC(title)}</p>'
               f'<p style="font-size:12px;color:#50677a;overflow-wrap:anywhere">报告编号：{ESC(batch.id)}</p>'
               f'<p><a style="color:#174b76" href="{ESC(settings().public_base_url)}/admin/reports/{ESC(batch.id)}/view">阅读网页版完整报告</a></p></header>'
               '<!--VOLUME--><section><h2 style="font-size:20px">风险概览</h2>'
@@ -78,6 +89,8 @@ def header(batch, state):
               f'<p style="font-size:13px;color:#50677a">本期筛选窗口：{ESC(label_time(start))} 至 {ESC(label_time(batch.cutoff))}。'
               '积压补报可早于此窗口，其原始时间和首次待报时间逐条列示。</p>')
     bootstrap = state.work.get("bootstrap")
+    if state.work.get("parent_fact_id"):
+        result += f'<p>对应事实报告：<a href="{ESC(settings().public_base_url)}/admin/reports/{ESC(state.work["parent_fact_id"])}/view">{ESC(state.work["parent_fact_id"])}</a></p>'
     if bootstrap:
         result += (f'<p>分阶段采集：暂存候选待核实 {bootstrap["unverified"]} 条、日期冲突 {bootstrap["conflicts"]} 条、'
                    f'待补证 {bootstrap["pending"]} 条、超大待核查 {bootstrap.get("oversized", 0)} 条；这些数量独立于正式漏洞库和本批合格候选。'
@@ -93,7 +106,7 @@ def header(batch, state):
 
 
 def article(item):
-    facts, analysis = item.snapshot, item.analysis or {}
+    facts, analysis = display_facts(item.snapshot), item.analysis or {}
     severity = SEVERITY.get(facts.get("severity"), "未评分")
     identifiers = ", ".join(facts.get("aliases", [])) or "暂无公开编号"
     if facts.get("mentioned_cves"):
@@ -111,8 +124,13 @@ def article(item):
               f'重要变化时间：{ESC(label_time(timeline.get("material_changed_at"), timeline.get("important_precision")))}；依据：{text(timeline.get("change_basis"))}<br>'
               f'本库观察到变化：{ESC(label_time(timeline.get("change_observed_at")))}<br>'
               f'首次待报时间：{ESC(label_time(facts.get("first_eligible_at")))}</p>')
-    for field, label in FIELDS.items():
-        value = analysis.get(field) or "未公开／未确认"
+    if facts.get("_display_truncated"):
+        result += '<p>展示字段为节选，完整原始事实见归档report.json；未省略任何入选记录。</p>'
+    fields = fact_fields(facts) if facts.get("_report_kind") == "facts" else None
+    for field, label in (fields if fields is not None else FIELDS).items():
+        value = fields[field] if fields is not None else analysis.get(field) or "未公开／未确认"
+        if fields is not None:
+            label = field
         if field == "evidence_level":
             value = EVIDENCE.get(value, "未确认")
         result += f'<h4 style="font-size:15px;margin:16px 0 4px;color:#173b61">{label}</h4><p style="margin:0;overflow-wrap:anywhere">{text(value)}</p>'
@@ -121,7 +139,7 @@ def article(item):
 
 
 def markdown_article(item):
-    facts, analysis = item.snapshot, item.analysis or {}
+    facts, analysis = display_facts(item.snapshot), item.analysis or {}
     result = f'### {ESC(facts["title"])}\n\n编号：{ESC(", ".join(facts.get("aliases", [])))}\n\n'
     result += f'严重性：{SEVERITY.get(facts.get("severity"), "未评分")}；已利用：{"是" if facts.get("exploited") else "未确认"}\n\n'
     result += f'类别：{category_label(facts)}；首次待报时间：{label_time(facts.get("first_eligible_at"))}\n\n'
@@ -131,13 +149,61 @@ def markdown_article(item):
     result += f'重要变化时间：{label_time(timeline.get("material_changed_at"), timeline.get("important_precision"))}；依据：{ESC(str(timeline.get("change_basis") or "未确认"))}\n\n'
     result += f'本库观察到变化：{label_time(timeline.get("change_observed_at"))}\n\n'
     result += f'上游更新时间：{label_time(timeline.get("upstream_updated_at"))}\n\n'
-    for field, label in FIELDS.items():
-        value = analysis.get(field) or "未公开／未确认"
+    if facts.get("_display_truncated"):
+        result += '展示字段为节选，完整原始事实见归档report.json；未省略任何入选记录。\n\n'
+    fields = fact_fields(facts) if facts.get("_report_kind") == "facts" else None
+    for field, label in (fields if fields is not None else FIELDS).items():
+        value = fields[field] if fields is not None else analysis.get(field) or "未公开／未确认"
+        if fields is not None:
+            label = field
         if field == "evidence_level":
             value = EVIDENCE.get(value, "未确认")
         result += f'#### {label}\n\n{ESC(value)}\n\n'
     return result + "参考来源：\n\n" + "".join("- " + ESC(url) + "\n" for url in sorted(set(
         list(facts.get("references", [])) + list(facts.get("date_references", [])) + list(analysis.get("references", []))))) + "\n"
+
+
+def fact_fields(facts):
+    import json
+    records = facts.get("source_records") or [facts]
+    def bounded(value, limit=8000):
+        value = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        return value if len(value) <= limit else value[:limit] + "（节选；完整原始事实见归档report.json）"
+    affected = [{"来源": r.get("source", r.get("source_authority")), "影响与修复版本原始字段": r.get("affected")}
+                for r in records if r.get("affected")]
+    repair = [{"来源": r.get("source", r.get("source_authority")), "原始修复信息": r.get("remediation") or r.get("remediations")}
+              for r in records if r.get("remediation") or r.get("remediations")]
+    ratings = [{"来源": r.get("source", r.get("source_authority")), "评级": r.get("severity"),
+                "评分": r.get("score"), "评分依据": r.get("cvss")} for r in records if r.get("severity") != "unknown"]
+    return {"报告性质": "仅公开事实，模型详解待补充；下列原文字段不代表本服务复现或推断。",
+            "原文摘要": bounded(facts.get("description") or facts.get("title"), 4000),
+            "评级及依据": bounded(ratings) if ratings else "未公开／未确认",
+            "影响版本及已公开修复版本": bounded(affected) if affected else "未公开／未确认",
+            "其他公开修复与缓解信息": bounded(repair) if repair else "来源未提供独立修复说明；请核对引用公告和上述版本原始字段。"}
+
+
+def display_facts(facts):
+    """Bound presentation, never evidence. Full immutable JSON remains untouched."""
+    result = dict(facts)
+    changed = False
+    for name, cap in [("title", 500), ("product_group", 200)]:
+        value = facts.get(name)
+        if isinstance(value, str) and len(value) > cap:
+            result[name] = value[:cap] + "（节选，完整见report.json）"
+            changed = True
+    for name, cap in [("aliases", 100), ("mentioned_cves", 100), ("references", 50), ("date_references", 50)]:
+        values = facts.get(name) or []
+        shown = [v for v in values[:cap] if isinstance(v, str) and len(v) <= 2048]
+        result[name] = shown
+        changed = changed or len(shown) != len(values)
+    timeline = dict(facts.get("timeline", {}))
+    for name in ["publication_basis", "publication_source", "publication_original", "change_basis"]:
+        value = timeline.get(name)
+        if isinstance(value, str) and len(value) > 512:
+            timeline[name] = value[:512] + "（节选，完整见report.json）"
+            changed = True
+    result["timeline"], result["_display_truncated"] = timeline, changed
+    return result
 
 
 def coverage(batch, state):

@@ -54,3 +54,25 @@ def migration_005(connection):
     from .db import RecentCandidate, RecentSource
     for table in [RecentSource, RecentCandidate]:
         table.__table__.create(connection, checkfirst=True)
+
+
+def migration_006(connection):
+    from .db import Publication, PublicationClaim, PublicationReceipt
+    for table in [Publication, PublicationClaim, PublicationReceipt]:
+        table.__table__.create(connection, checkfirst=True)
+    from sqlalchemy import select, update, delete, literal, or_
+    from .db import Batch, ReportState, ReportBacklog, Vulnerability, Job, Audit, now
+    for identity, work in connection.execute(select(Batch.id, ReportState.work).join(ReportState).where(
+            Batch.status.in_(["preparing", "analyzing", "failed"]))):
+        if not work.get("critical_only"):
+            connection.execute(update(Batch).where(Batch.id == identity).values(status="superseded", slot="old:" + identity,
+                error="1.5.0严重级别策略重建；原分析保留供审计，未计为已报"))
+            connection.execute(delete(Job).where(Job.kind == "report", Job.source_id == identity))
+            connection.execute(Audit.__table__.insert().values(at=now(), actor="migration-006",
+                action="report.policy-superseded", target=identity))
+    invalid = select(ReportBacklog.vulnerability_id).outerjoin(Vulnerability,
+        Vulnerability.id == ReportBacklog.vulnerability_id).where(or_(Vulnerability.severity != "critical", Vulnerability.id.is_(None)))
+    connection.execute(Audit.__table__.insert().from_select(["at", "actor", "action", "target"],
+        select(literal(now()), literal("migration-006"), literal("backlog.policy-withdrawn"),
+               ReportBacklog.vulnerability_id).where(ReportBacklog.vulnerability_id.in_(invalid))))
+    connection.execute(delete(ReportBacklog).where(ReportBacklog.vulnerability_id.in_(invalid)))

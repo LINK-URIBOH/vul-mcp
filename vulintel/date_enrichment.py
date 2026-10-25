@@ -118,10 +118,14 @@ def _fetch_cached(url, *, identifier=None, transport=None, heartbeat=None):
             return cached.data
     client = CollectorHTTP(transport=transport, heartbeat=heartbeat)
     try:
-        with _request_lock:
-            scheduled = max(time.monotonic(), _last_request + settings().publication_request_interval)
-            _last_request = scheduled
-        client.pause(max(0, scheduled - time.monotonic()))
+        def pace(_request):
+            global _last_request
+            # Pace actual request starts, not reservations. A delayed thread must
+            # not compress the next interval to catch up with an old reservation.
+            with _request_lock:
+                client.pause(max(0, _last_request + settings().publication_request_interval - time.monotonic()))
+                _last_request = time.monotonic()
+        client.client.event_hooks["request"].append(pace)
         with client.downloaded(url, limit=LIMIT) as stream:
             raw = stream.read(LIMIT + 1)
         if len(raw) > LIMIT:

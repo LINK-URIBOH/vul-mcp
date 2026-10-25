@@ -111,6 +111,39 @@ class Job(Base):
     error: Mapped[str | None] = mapped_column(Text)
 
 
+class Publication(Base):
+    """A typed publication owns an ordinary archive Batch and its delivery rows."""
+    __tablename__ = "report_publications"
+    id: Mapped[str] = mapped_column(ForeignKey("batches.id"), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(20), index=True)
+    slot: Mapped[str] = mapped_column(String(40), index=True)
+    key: Mapped[str] = mapped_column(String(160), unique=True)
+    source_batch_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    parent_fact_id: Mapped[str | None] = mapped_column(String(36))
+    triggered_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    deadline: Mapped[datetime] = mapped_column(DateTime)
+
+
+class PublicationClaim(Base):
+    """Freeze a saved analysis once, before rendering; coverage is acknowledged later."""
+    __tablename__ = "publication_claims"
+    source_item_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    publication_id: Mapped[str] = mapped_column(ForeignKey("batches.id"), index=True)
+    artifact_item_id: Mapped[int] = mapped_column(Integer)
+
+
+class PublicationReceipt(Base):
+    __tablename__ = "publication_receipts"
+    __table_args__ = (UniqueConstraint("kind", "vulnerability_id", "event_key"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    publication_id: Mapped[str] = mapped_column(ForeignKey("batches.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(20))
+    vulnerability_id: Mapped[str] = mapped_column(String(36), index=True)
+    event_key: Mapped[str] = mapped_column(String(64))
+    revision_id: Mapped[int] = mapped_column(ForeignKey("vulnerability_revisions.id"))
+    date_annotation_id: Mapped[int | None] = mapped_column(Integer)
+
+
 class Audit(Base):
     __tablename__ = "audit"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -337,7 +370,7 @@ def migrate():
         from sqlalchemy import select
         Migration.__table__.create(conn, checkfirst=True)
         versions = set(conn.execute(select(Migration.version)).scalars())
-        if versions - {1, 2, 3, 4, 5} or any(v in versions and v - 1 not in versions for v in (2, 3, 4, 5)):
+        if versions - {1, 2, 3, 4, 5, 6} or any(v in versions and v - 1 not in versions for v in (2, 3, 4, 5, 6)):
             raise ValueError("数据库迁移版本不兼容，拒绝自动修改")
         if 1 not in versions:
             for table in [Source, Vulnerability, Alias, SourceRecord, Batch, BatchItem, Delivery,
@@ -360,3 +393,7 @@ def migrate():
             from .migrations import migration_005
             migration_005(conn)
             conn.execute(Migration.__table__.insert().values(version=5, applied=now()))
+        if 6 not in versions:
+            from .migrations import migration_006
+            migration_006(conn)
+            conn.execute(Migration.__table__.insert().values(version=6, applied=now()))

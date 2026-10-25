@@ -45,18 +45,26 @@ def enqueue(db, batch_id):
     db.add(Job(kind="report", source_id=batch_id))
 
 
-def status(db, batch):
+def status(db, batch, fact_report_id=None):
     state = db.get(ReportState, batch.id)
     wrong_date = db.scalar(select(func.count()).select_from(BatchItem).where(BatchItem.batch_id == batch.id,
         or_(BatchItem.snapshot["timeline"]["date_policy"].as_integer().is_(None),
             BatchItem.snapshot["timeline"]["date_policy"].as_integer() != DATE_POLICY,
             BatchItem.snapshot["timeline"]["event_policy"].as_integer().is_(None),
             BatchItem.snapshot["timeline"]["event_policy"].as_integer() != EVENT_POLICY)))
-    result = {"batch_id": batch.id, "slot": batch.slot, "status": batch.status,
+    result = {"batch_id": batch.id, "slot": state.work.get("logical_slot", batch.slot) if state else batch.slot, "status": batch.status,
               "error": batch.error, "policy": state.policy if state else 1,
               "event_audit_required": bool(state and state.policy < EVENT_POLICY),
               "date_policy": DATE_POLICY, "old_date_mixed_count": wrong_date,
               "date_audit_required": bool(wrong_date or state and state.work.get("date_policy") != DATE_POLICY)}
+    if state:
+        result.update(report_kind=state.work.get("publication_kind", "analysis"),
+                      critical_only=bool(state.work.get("critical_only")), progressive=bool(state.work.get("progressive")),
+                      retry_at=state.work.get("retry_at"), heartbeat=state.work.get("heartbeat"),
+                      unknown_severity=state.work.get("unknown_severity", 0))
+    if fact_report_id or state and state.work.get("progressive"):
+        from .publications import related_status
+        result.update(related_status(db, batch, fact_report_id))
     if not state:
         total = db.scalar(select(func.count()).select_from(BatchItem).where(BatchItem.batch_id == batch.id))
         analyzed = db.scalar(select(func.count()).select_from(BatchItem).where(
@@ -68,7 +76,7 @@ def status(db, batch):
         BatchItem.batch_id == batch.id, BatchItem.analysis.is_not(None)))
     metadata = db.get(MetadataState, BACKFILL_KEY)
     return {**result, "ready": ready, "total": state.total if ready else None,
-            "analyzed": analyzed, "pending_analysis": state.total - analyzed if ready else None,
+            "analyzed": analyzed, "pending_analysis": state.total - analyzed if ready and state.work.get("publication_kind") != "facts" else None,
             "new_disclosures": state.new_count, "important_updates": state.update_count,
             "unverified_dates": state.unknown_count, "phase": state.work.get("phase"),
             "render_stage": state.work.get("render", {}).get("phase"),
@@ -84,10 +92,14 @@ def status(db, batch):
             "metadata_backfill": metadata.value if metadata else {"complete": False}}
 
 
-def open_batch(db, actor, slot=None):
+def open_batch(db, actor, slot=None, ensure_facts=False, progressive=False):
     from .maintenance import report_write_guard
     from .config import settings
     report_write_guard(db)
+    if (ensure_facts or progressive) and not settings().publisher_enabled:
+        raise ValueError("请先启用并运行独立 publisher 服务")
+    if progressive and not ensure_facts:
+        raise ValueError("渐进发布须同时启用事实版兜底")
     from .service import audit, due_slot, source_status
     slot = slot or due_slot()
     cutoff = datetime.fromisoformat(slot)
@@ -100,11 +112,34 @@ def open_batch(db, actor, slot=None):
     slot = cutoff.replace(tzinfo=timezone.utc).astimezone(ZoneInfo("Asia/Shanghai")).isoformat(timespec="minutes")
     if db.bind.dialect.name == "postgresql":
         db.execute(select(func.pg_advisory_xact_lock(86221023)))
-    pending = db.scalar(select(Batch).join(ReportState).where(Batch.status != "finalized")
-                        .order_by(Batch.cutoff).limit(1))
-    batch = pending or db.scalar(select(Batch).where(Batch.slot == slot))
+    from .db import Publication
+    fact = None
+    if ensure_facts:
+        from .publications import trigger_facts
+        fact = trigger_facts(db, actor, slot)
+    query = select(Batch).join(ReportState).where(Batch.status.in_(["preparing", "analyzing", "rendering", "failed"]),
+        ~exists(select(Publication.id).where(Publication.id == Batch.id)))
+    if ensure_facts:
+        query = query.where(ReportState.work["critical_only"].as_boolean().is_(True))
+    pending = db.scalar(query.order_by(Batch.cutoff).limit(1))
+    same_slot = db.scalar(select(Batch).where(Batch.slot == slot))
+    if ensure_facts and same_slot and same_slot.status not in {"finalized", "rendering"}:
+        same_state = db.get(ReportState, same_slot.id)
+        if not same_state or not same_state.work.get("critical_only"):
+            same_slot.status, same_slot.error = "superseded", "新严重级别策略取代旧草稿；分析保留审计"
+            same_slot.slot = "old:" + same_slot.id
+            db.execute(delete(Job).where(Job.kind == "report", Job.source_id == same_slot.id))
+            audit(db, actor, "batch.policy-superseded", same_slot.id)
+            db.flush()
+            same_slot = None
+    batch = pending or same_slot
     if batch:
         state = db.get(ReportState, batch.id)
+        if fact and (not state or not state.work.get("critical_only")):
+            # Preserve an already-rendering legacy archive without allowing it
+            # to roll back the independent current fact trigger.
+            db.commit()
+            return {**status(db, batch, fact.id), "analysis_note": "旧版归档保留原策略；当前事实版已独立触发"}
         if state and batch.status != "finalized" and state.policy < EVENT_POLICY:
             raise ValueError("未发布批次仍使用旧日期规则，请运行 repair-publication-dates --rebuild-unpublished")
         if state and batch.status == "failed":
@@ -114,9 +149,15 @@ def open_batch(db, actor, slot=None):
             batch.error = None
             if batch.status != "analyzing":
                 enqueue(db, batch.id)
+        if fact:
+            current = db.get(ReportState, batch.id)
+            if progressive and batch.status != "finalized":
+                current.work = {**current.work, "progressive": True,
+                                "fact_report_id": current.work.get("fact_report_id", fact.id)}
         db.commit()
-        return status(db, batch)
-    latest = db.scalar(select(Batch).join(ReportState).where(Batch.status == "finalized")
+        return status(db, batch, fact.id if fact else None)
+    latest = db.scalar(select(Batch).join(ReportState).where(Batch.status == "finalized",
+                       ~exists(select(Publication.id).where(Publication.id == Batch.id)))
                        .order_by(Batch.cutoff.desc()).limit(1))
     if latest and cutoff <= latest.cutoff:
         raise ValueError("时间段早于已完成的新规则报告")
@@ -124,11 +165,13 @@ def open_batch(db, actor, slot=None):
     db.add(batch)
     db.flush()
     db.add(ReportState(batch_id=batch.id, work={"phase": "prepare", "prepared": False,
-                                              "item_limit": settings().report_max_items, "date_policy": DATE_POLICY}))
+        "item_limit": min(50, settings().report_max_items) if ensure_facts else settings().report_max_items,
+        "date_policy": DATE_POLICY, "critical_only": ensure_facts, "progressive": progressive,
+        "fact_report_id": fact.id if fact else None}))
     enqueue(db, batch.id)
     audit(db, actor, "batch.create", batch.id)
     db.commit()
-    return status(db, batch)
+    return status(db, batch, fact.id if fact else None)
 
 
 def prepare_step(db, batch, state):
@@ -161,13 +204,37 @@ def prepare_step(db, batch, state):
         if used and used + byte_count > 2_000_000:
             break
         revision = db.get(Revision, identity)
+        strict = state.work.get("critical_only")
+        if strict and revision.snapshot.get("severity") != "critical":
+            rejected = db.get(ReportBacklog, revision.vulnerability_id)
+            if rejected and rejected.revision_id <= revision.id:
+                from .service import audit
+                audit(db, "publisher", "backlog.noncritical-withdrawn", revision.vulnerability_id)
+                db.delete(rejected)
+            if revision.snapshot.get("severity", "unknown") == "unknown":
+                state.work = {**state.work, "unknown_severity": state.work.get("unknown_severity", 0) + 1}
+            state.cursor = identity
+            used += byte_count
+            db.expunge(revision)
+            continue
         annotation = db.get(PublicationAnnotation, annotation_id) if annotation_id else None
         projection = db.get(RevisionDateProjection, identity)
+        if strict and (not annotation or not projection or projection.policy != EVENT_POLICY):
+            db.add(UnverifiedItem(batch_id=batch.id, revision_id=revision.id,
+                title=revision.snapshot.get("title", "未确认"), identifiers=", ".join(revision.snapshot.get("aliases", [])),
+                references=revision.snapshot.get("references", []), date_annotation_id=annotation_id,
+                reason="missing_current_annotation"))
+            state.unknown_count += 1
+            state.cursor = identity
+            used += byte_count
+            continue
         facts = corrected_snapshot(revision, projection, annotation)
+        from .db import Publication
         prior = db.execute(select(ReportSelection, BatchItem).join(BatchItem).join(Batch)
                            .join(Revision, Revision.id == ReportSelection.revision_id)
                            .where(Revision.vulnerability_id == revision.vulnerability_id,
-                                  Batch.status == "finalized")
+                                  Batch.status == "finalized",
+                                  ~exists(select(Publication.id).where(Publication.id == Batch.id)))
                            .order_by(Batch.cutoff.desc()).limit(1)).first()
         old = db.get(Revision, prior[0].revision_id) if prior else None
         old_projection = db.get(RevisionDateProjection, old.id) if old else None
@@ -176,6 +243,11 @@ def prepare_step(db, batch, state):
                      and projection.important_end_at is not None and projection.important_end_at <= batch.cutoff
                      and (not old_projection or not old_projection.important_at
                           or projection.important_at > old_projection.important_at))
+        if strict:
+            from .publications import received
+            receipt_kind = "facts" if state.work.get("publication_kind") == "facts" else "detail"
+            new = new and not received(db, receipt_kind, revision.vulnerability_id, facts, "new")
+            important = important and not received(db, receipt_kind, revision.vulnerability_id, facts, "update")
         backlog = db.get(ReportBacklog, revision.vulnerability_id)
         # Later authoritative evidence can invalidate an earlier "new" date.
         # Persistence is for qualified overflow, not for preserving a disproved
@@ -204,6 +276,11 @@ def prepare_step(db, batch, state):
                                  reason="uncertain_window" if uncertain_window else annotation.status))
             state.unknown_count += 1
         elif new or important or (backlog and (old is None or revision.id > old.id)):
+            category = "new" if new else "update" if important else backlog.category
+            if strict and received(db, receipt_kind, revision.vulnerability_id, facts, category):
+                state.cursor = identity
+                used += byte_count
+                continue
             risk = {"unknown": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
             rank = (10 if facts.get("exploited") else 0) + risk.get(facts.get("severity"), 0)
             if backlog is None:
@@ -215,7 +292,7 @@ def prepare_step(db, batch, state):
                                    revision_id=revision.id,
                                    date_annotation_id=annotation.id,
                                    first_eligible_at=backlog.first_eligible_at if backlog else batch.cutoff,
-                                   category=backlog.category if backlog else "new" if new else "update", rank=rank))
+                                   category=category if strict else backlog.category if backlog else "new" if new else "update", rank=rank))
         state.cursor = identity
         used += byte_count
         db.flush()
@@ -228,7 +305,8 @@ def prepare_step(db, batch, state):
 def select_step(db, batch, state):
     """Freeze the highest priority candidates only after the full scan has finished."""
     from .config import settings
-    limit = state.work.get("item_limit", settings().report_max_items)
+    is_facts = state.work.get("publication_kind") == "facts"
+    limit = state.work.get("candidate_total", 0) if is_facts else state.work.get("item_limit", settings().report_max_items)
     selected = select(BatchItem.vulnerability_id).where(BatchItem.batch_id == batch.id)
     rows = list(db.scalars(select(ReportCandidate).where(ReportCandidate.batch_id == batch.id,
         ReportCandidate.vulnerability_id.not_in(selected))
@@ -248,6 +326,8 @@ def select_step(db, batch, state):
         is_backlog = candidate.first_eligible_at < start or not event_at or event_at < start
         facts = {**facts, "report_category": candidate.category,
                  "report_backlog": is_backlog, "first_eligible_at": iso(candidate.first_eligible_at)}
+        if is_facts:
+            facts["_report_kind"] = "facts"
         item = BatchItem(batch_id=batch.id, vulnerability_id=candidate.vulnerability_id, snapshot=facts, priority=True)
         db.add(item)
         db.flush()
@@ -268,21 +348,49 @@ def select_step(db, batch, state):
         db.expunge(revision)
     if not rows or state.total >= limit:
         db.execute(delete(ReportCandidate).where(ReportCandidate.batch_id == batch.id))
-        work.update(prepared=True, phase="analyzing", deferred_count=max(0, work["candidate_total"] - state.total))
-        batch.status = "analyzing"
+        work.update(prepared=True, phase="render" if is_facts else "analyzing",
+                    deferred_count=max(0, work["candidate_total"] - state.total))
+        batch.status = "rendering" if is_facts else "analyzing"
     state.work = work
 
 
-def batch_page(db, batch_id, after=0, limit=10, pending_only=False):
+def batch_page(db, batch_id, after=0, limit=10, pending_only=False, include_evidence=False, max_bytes=262144):
     batch = db.get(Batch, batch_id)
     if batch is None:
         raise ValueError("未知报告批次")
-    if not 1 <= limit <= 20 or after < 0:
+    if not 1 <= limit <= (50 if include_evidence else 20) or after < 0 or not 16384 <= max_bytes <= settings_budget():
         raise ValueError("分页参数无效")
     result = status(db, batch)
     if not result["ready"]:
         return {**result, "coverage": batch.coverage, "items": [], "next_after": None,
                 "note": "批次正在准备；尚不能判断是否无记录，请稍后查询"}
+    if include_evidence:
+        # Keep the evidence budget for evidence, not repeated delivery history
+        # or bootstrap diagnostics (available from the dedicated status tools).
+        result = {k: v for k, v in result.items() if k not in {
+            "bootstrap", "metadata_backfill", "fact_report", "supplements", "aggregate"}}
+        query = select(BatchItem.id, func.length(cast(BatchItem.snapshot, Text))).where(BatchItem.batch_id == batch_id, BatchItem.id > after)
+        if pending_only:
+            query = query.where(BatchItem.analysis.is_(None))
+        rows = list(db.execute(query.order_by(BatchItem.id).limit(limit + 1)))
+        page = []
+        for identity, characters in rows[:limit]:
+            value = {"item_id": identity, "evidence_complete": False, "evidence_required": True,
+                     "note": "单条超过响应预算，须使用get_item_evidence完整续页"}
+            item = db.get(BatchItem, identity) if characters < max_bytes else None
+            if item:
+                value = {"item_id": item.id, "priority": item.priority, "snapshot": item.snapshot,
+                         "evidence_complete": True, "analysis": item.analysis}
+            if evidence_wire_size({**result, "items": [*page, value]}) + 2048 > max_bytes:
+                if page:
+                    break
+                value = {"item_id": identity, "evidence_complete": False,
+                         "evidence_required": True, "note": "单条超过响应预算，须使用get_item_evidence完整续页"}
+            page.append(value)
+            if item:
+                db.expunge(item)
+        return {**result, "items": page, "next_after": page[-1]["item_id"] if page and len(rows) > len(page) else None,
+                "max_bytes": max_bytes, "note": "evidence_complete=true包含完整冻结事实；否则必须续读get_item_evidence"}
     columns = [BatchItem.id, BatchItem.priority, BatchItem.analysis]
     names = ["aliases", "severity", "exploited", "product_group", "timeline", "report_category", "mentioned_cves",
              "report_backlog", "first_eligible_at"]
@@ -322,6 +430,19 @@ def batch_page(db, batch_id, after=0, limit=10, pending_only=False):
             "note": "本页为有界摘要；使用 get_item_evidence 续页读取完整来源事实，不得仅凭摘要分析"}
 
 
+def settings_budget():
+    from .config import settings
+    return settings().report_evidence_max_bytes
+
+
+def evidence_wire_size(payload):
+    # MCP 2.3 emits both pretty-printed TextContent and structuredContent.
+    # Budget both copies and JSON escaping instead of only the logical data.
+    from pydantic_core import to_json
+    content = to_json(payload, fallback=str, indent=2).decode()
+    return len(to_json({"content": [{"type": "text", "text": content}], "structuredContent": payload}))
+
+
 def item_evidence(db, batch_id, item_id, offset=0, limit=16000):
     if offset < 0 or not 1 <= limit <= 16000:
         raise ValueError("证据分页参数无效")
@@ -335,13 +456,23 @@ def item_evidence(db, batch_id, item_id, offset=0, limit=16000):
             "next_offset": offset + len(row[0]) if offset + len(row[0]) < row[1] else None}
 
 
-def finalize(db, actor, batch_id, summary="", overview=None):
+def finalize(db, actor, batch_id, summary="", overview=None, mode="complete"):
     from .maintenance import report_write_guard
     report_write_guard(db)
     from .service import audit
     batch = db.scalar(select(Batch).where(Batch.id == batch_id).with_for_update())
     if batch is None:
         raise ValueError("未知报告批次")
+    if mode == "supplement":
+        from .publications import flush_supplements
+        state = db.get(ReportState, batch_id)
+        if not state or not state.work.get("progressive"):
+            raise ValueError("该批次未授权渐进发布")
+        publications = flush_supplements(db, batch_id, force=True)
+        db.commit()
+        return {**status(db, batch), "queued_supplements": publications}
+    if mode != "complete":
+        raise ValueError("未知发布模式")
     if batch.status == "finalized":
         return status(db, batch)
     state = db.get(ReportState, batch_id)
@@ -355,6 +486,16 @@ def finalize(db, actor, batch_id, summary="", overview=None):
         BatchItem.batch_id == batch_id, BatchItem.analysis.is_(None)))
     if missing:
         raise ValueError(f"仍有{missing}条记录需要完成逐条详解")
+    if state.work.get("progressive"):
+        from .publications import flush_supplements
+        if batch.status == "analyzing":
+            if overview is not None:
+                state.overview = overview.model_dump() if hasattr(overview, "model_dump") else overview
+            batch.summary = summary or batch.summary
+            audit(db, actor, "batch.aggregate_requested", batch_id)
+        flush_supplements(db, batch_id, force=True)
+        db.commit()
+        return status(db, batch)
     if batch.status == "rendering":
         return status(db, batch)
     if state.work.get("phase") == "render":
@@ -412,6 +553,7 @@ def run_report_once():
             job = db.get(Job, identity)
             job.status = "done" if state.work["phase"] in {"analyzing", "complete"} else "pending"
             job.lease_until, job.error = None, None
+            state.work = {**state.work, "heartbeat": iso(now()), "retry_at": None, "retry_attempts": 0}
             db.commit()
             log.info(json.dumps({"event": "report_step", "batch_id": batch_id, "phase": state.work["phase"],
                                  "prepared": state.total, "elapsed": round(time.monotonic() - started, 3)}))
@@ -426,5 +568,10 @@ def run_report_once():
             job.status, job.error, job.lease_until = "failed", f"{reason}；追踪编号 {correlation}", None
             if batch:
                 batch.status, batch.error = "failed", job.error
+                state = db.get(ReportState, batch_id)
+                attempts = state.work.get("retry_attempts", 0) + 1
+                state.work = {**state.work, "retry_attempts": attempts,
+                    "retry_at": iso(now() + timedelta(seconds=min(3600, 30 * 2 ** min(attempts, 7))))
+                    if not isinstance(exc, ValueError) and attempts < 8 else None}
             db.commit()
     return True

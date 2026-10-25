@@ -27,7 +27,7 @@ def start(db):
     if row is None:
         job = Job(id=uid(), kind="maintenance", source_id=REPAIR_KEY, status="running")
         db.add(job)
-        targets = list(db.scalars(select(Batch.id).where(Batch.status != "finalized").order_by(Batch.id)))
+        targets = list(db.scalars(select(Batch.id).where(Batch.status.in_(["preparing", "analyzing", "rendering", "failed"])).order_by(Batch.id)))
         row = MetadataState(key=REPAIR_KEY, value={"job_id": job.id, "phase": "rebuild", "complete": False,
                 "targets": targets, "rebuild_index": 0, "started_at": iso(now()), "before": coverage(db),
                 "processed": 0, "corrected_dates": 0, "projections_written": 0, "network_gaps": 0})
@@ -56,12 +56,27 @@ def cleanup_one(db, value):
     if root.exists():
         shutil.rmtree(root)
     items = select(BatchItem.id).where(BatchItem.batch_id == identity)
+    from .db import Publication, PublicationClaim
+    publication = db.get(Publication, identity)
+    if publication and publication.kind == "supplement":
+        # Its immutable analysis still exists in the source batch; release claims for regeneration.
+        from .publications import cleanup
+        cleanup(db, identity)
+        db.execute(delete(PublicationClaim).where(PublicationClaim.source_item_id.in_(items)))
+    old_work = dict(db.get(ReportState, identity).work) if db.get(ReportState, identity) else {}
     db.execute(delete(Delivery).where(Delivery.batch_id == identity))
     db.execute(delete(ReportSelection).where(ReportSelection.item_id.in_(items)))
     db.execute(delete(ReportCandidate).where(ReportCandidate.batch_id == identity))
     db.execute(delete(UnverifiedItem).where(UnverifiedItem.batch_id == identity))
     db.execute(delete(BatchItem).where(BatchItem.batch_id == identity))
     db.execute(delete(Job).where(Job.kind == "report", Job.source_id == identity))
+    if publication and publication.kind == "supplement":
+        state = db.get(ReportState, identity)
+        state.work = {"phase": "complete", "prepared": True, "date_policy": DATE_POLICY,
+                      "publication_kind": "supplement"}
+        batch.status, batch.error = "superseded", "日期重建取代未发布补充版，原始详解仍保留在分析批次"
+        value["rebuild_index"] = index + 1
+        return
     state = db.get(ReportState, identity)
     from .config import settings
     limit = state.work.get("item_limit", settings().report_max_items) if state else settings().report_max_items
@@ -71,7 +86,9 @@ def cleanup_one(db, value):
     state.policy, state.watermark, state.cursor = EVENT_POLICY, None, 0
     state.total, state.new_count, state.update_count, state.unknown_count = 0, 0, 0, 0
     state.coverage_at, state.overview = now(), {}
-    state.work = {"phase": "prepare", "prepared": False, "item_limit": limit, "date_policy": DATE_POLICY}
+    state.work = {**{k: v for k, v in old_work.items() if k in {"critical_only", "progressive", "fact_report_id",
+        "publication_kind", "logical_slot", "parent_fact_id"}},
+        "phase": "prepare", "prepared": False, "item_limit": limit, "date_policy": DATE_POLICY}
     batch.status, batch.summary, batch.error = "preparing", "", None
     value["rebuild_index"] = index + 1
 
@@ -183,6 +200,8 @@ def run_repair(emit=print, transport=None):
                             from .report_jobs import enqueue, status
                             old_dates = 0
                             for identity in value["targets"]:
+                                if db.get(Batch, identity).status == "superseded":
+                                    continue
                                 batch = db.get(Batch, identity)
                                 result = status(db, batch)
                                 if result["date_audit_required"]:

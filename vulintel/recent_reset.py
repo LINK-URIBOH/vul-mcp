@@ -18,8 +18,8 @@ BLOCKED = "近七天重置尚未完成，请运行 reset-recent --days 7 --clear
 
 
 def tables():
-    from .db import UnverifiedItem
-    return [ReportSelection, ReportCandidate, UnverifiedItem, Delivery, BatchItem, ReportState, Batch,
+    from .db import UnverifiedItem, Publication, PublicationClaim, PublicationReceipt
+    return [PublicationReceipt, PublicationClaim, Publication, ReportSelection, ReportCandidate, UnverifiedItem, Delivery, BatchItem, ReportState, Batch,
             ReportBacklog, RecentCandidate, RecentSource, RevisionDateProjection, PublicationState,
             PublicationAnnotation, Revision, Alias, SourceRecord, Vulnerability]
 

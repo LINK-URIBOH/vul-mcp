@@ -361,12 +361,12 @@ def test_schema_upgrade_preserves_existing_dates_and_new_tables(store):
     from vulintel.db import Migration
     with store() as db:
         ingest(db, "nvd", record())
-        db.execute(text("DELETE FROM schema_migrations WHERE version=5"))
+        db.execute(text("DELETE FROM schema_migrations WHERE version>=5"))
         db.commit()
     database.migrate()
     database.migrate()
     with store() as db:
-        assert db.scalar(select(func.count()).select_from(Migration)) == 5
+        assert db.scalar(select(func.count()).select_from(Migration)) == 6
         assert db.scalar(select(func.count()).select_from(Revision)) == 1
 
 

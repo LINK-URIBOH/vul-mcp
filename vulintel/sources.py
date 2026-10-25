@@ -49,10 +49,13 @@ def text(value):
 
 def entry(key, title, description, aliases=None, references=None, affected=None,
           severity="unknown", score=None, exploited=False, modified=None, published=None, **extra):
+    severity = {"important": "high", "moderate": "medium"}.get(str(severity).lower(), str(severity).lower())
+    rating = {"source": extra.get("source_authority"), "severity": severity, "score": score,
+              "cvss": extra.get("cvss"), "basis": "来源结构化评级；未评分不等于低危"}
     return {"source_key": str(key), "title": str(title or key), "description": str(description or ""),
             "aliases": sorted(set(aliases or [])), "references": sorted(set(references or [])),
             "affected": affected or [], "severity": severity if severity in RANK else "unknown",
-            "score": score, "exploited": exploited, "modified": modified, "published": published, **extra}
+            "score": score, "severity_evidence": rating, "exploited": exploited, "modified": modified, "published": published, **extra}
 
 
 def nvd_record(cve):
@@ -66,7 +69,10 @@ def nvd_record(cve):
                  [r["url"] for r in cve.get("references", [])],
                  cve.get("configurations", []), severity, cvss.get("baseScore"),
                  "cisaExploitAdd" in cve, cve.get("lastModified"), cve.get("published"),
-                 cvss=cvss, status=cve.get("vulnStatus"), source_authority="NVD", exploitation_added_at=cve.get("cisaExploitAdd"))
+                 cvss=cvss, severity_ratings=[{"metric": name, "source": row.get("source"), "type": row.get("type"),
+                     "cvss": row.get("cvssData"), "severity": row.get("baseSeverity")}
+                     for name, rows in metrics.items() for row in rows],
+                 status=cve.get("vulnStatus"), source_authority="NVD", exploitation_added_at=cve.get("cisaExploitAdd"))
 
 
 def ghsa_record(record):
@@ -75,7 +81,8 @@ def ghsa_record(record):
                  record.get("references", []) + [record["html_url"]], record.get("vulnerabilities", []),
                  record.get("severity", "unknown"), (record.get("cvss") or {}).get("score"),
                  modified=record.get("updated_at"), published=record.get("published_at"),
-                 withdrawn=record.get("withdrawn_at"), source_authority="GitHub Advisory")
+                 withdrawn=record.get("withdrawn_at"), cvss=record.get("cvss_severities") or record.get("cvss"),
+                 source_authority="GitHub Advisory")
 
 
 def osv_record(record):
@@ -249,9 +256,10 @@ class Upstream(CollectorHTTP):
                         notes = "\n".join(text(x.get("Value", "")) for x in item.get("Notes", []))
                         title = item.get("Title", {})
                         title = title.get("Value", identifier) if isinstance(title, dict) else title
-                        severity = next((str(t.get("Description", {}).get("Value", "unknown")).lower()
-                                         for t in item.get("Threats", []) if t.get("Type") == 3), "unknown")
-                        severity = {"important": "high", "moderate": "medium"}.get(severity, severity)
+                        ratings = [str(t.get("Description", {}).get("Value", "unknown")).lower()
+                                   for t in item.get("Threats", []) if t.get("Type") == 3]
+                        ratings = [{"important": "high", "moderate": "medium"}.get(s, s) for s in ratings]
+                        severity = max(ratings, key=lambda s: RANK.get(s, 0), default="unknown")
                         history = item.get("RevisionHistory", {})
                         history = history.get("Revision", []) if isinstance(history, dict) else history
                         history = history if isinstance(history, list) else [history]
@@ -259,13 +267,17 @@ class Upstream(CollectorHTTP):
                                  and re.search(r"information published|initial (?:public|release)|first (?:public|release)",
                                                str(r.get("Description", "")), re.I)]
                         published = min((d for d in dates if d[0]), default=(None, None))[1]
+                        if getattr(self, "initial_window", False) and parse_stamp(published) and parse_stamp(published) < start:
+                            # A monthly document's CurrentReleaseDate is not this CVE's disclosure.
+                            # Incremental collection still examines real remediation events.
+                            continue
                         yield entry(identifier, title, notes, [identifier],
                                     [f"https://msrc.microsoft.com/update-guide/vulnerability/{identifier}"],
                                     item.get("ProductStatuses", []), severity,
                                     modified=update.get("CurrentReleaseDate"),
                                     published=published, publication_basis="微软条目明确首次公开修订",
                                     publication_kind="initial_disclosure", publication_timezone="UTC",
-                                    revision_history=history,
+                                    revision_history=history, severity_ratings=item.get("Threats", []),
                                     remediations=item.get("Remediations", []), source_authority="Microsoft")
         elif source.kind == "psf":
             import json

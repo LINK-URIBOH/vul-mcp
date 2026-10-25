@@ -227,9 +227,13 @@ async def reports(request):
         counts = {row.batch_id: row for row in db.execute(select(ReportState.batch_id, ReportState.total,
                   ReportState.new_count, ReportState.update_count, ReportState.unknown_count).where(
                       ReportState.batch_id.in_([record.id for record in records])))}
-        return page(request, identity, "报告归档", columns=["时间段（北京时间）", "状态", "摘要"],
-                    rows=[{"cells": [b.slot, b.status,
-                           f"逐条详解 {counts[b.id].total} 条；日期待核实 {counts[b.id].unknown_count} 条" if b.id in counts else "旧规则历史报告"],
+        from .db import Publication
+        publications = {p.id: p for p in db.scalars(select(Publication).where(Publication.id.in_([b.id for b in records])))}
+        from .publications import LABELS
+        return page(request, identity, "报告归档", columns=["时间段（北京时间）", "类型", "状态", "摘要"],
+                    rows=[{"cells": [publications[b.id].slot if b.id in publications else b.slot,
+                           LABELS[publications[b.id].kind] if b.id in publications else "模型详解批次", b.status,
+                           f"条目 {counts[b.id].total} 条；日期待核实 {counts[b.id].unknown_count} 条" if b.id in counts else "旧规则历史报告"],
                            "link": "/admin/reports/" + b.id} for b in records[:100]],
                     next_url=f"?offset={offset + 100}" if len(records) > 100 else None)
 
@@ -242,18 +246,17 @@ async def report_detail(request):
         batch = db.get(Batch, request.path_params["bid"])
         if not batch:
             raise HTTPException(404)
-        pending = db.scalar(select(func.count()).select_from(BatchItem).where(
-            BatchItem.batch_id == batch.id, BatchItem.priority.is_(True), BatchItem.analysis.is_(None)))
         state = db.get(ReportState, batch.id)
         from .report_jobs import status as report_status
         from .report_content import scope_text
         progress = report_status(db, batch)
+        from .publications import publisher_status
         return page(request, identity, "报告 · " + batch.slot,
                     summary=((scope_text(state) + f" 公开日期待核实 {state.unknown_count} 条。" if progress["ready"] else
                               "正在准备候选与冻结证据，尚不能判断为空报告。") if state else "旧规则历史报告，保留原始归档。"),
                     diagnostic_summary=batch.summary,
                     report_view=f"/admin/reports/{batch.id}/view" if batch.status == "finalized" else None,
-                    detail=f"状态：{STATUS_LABELS.get(batch.status, batch.status)}；总数：{progress.get('total', '未知')}；待逐条分析：{progress.get('pending_analysis', pending)}。{batch.error or ''} 未完成批次可继续恢复。",
+                    detail=json.dumps({"进度": progress, "publisher": publisher_status()}, ensure_ascii=False, indent=2),
                     downloads=[{"label": label, "url": f"/admin/reports/{batch.id}/download/{kind}"}
                                for kind, label in [("html", "HTML"), ("markdown", "Markdown"), ("json", "JSON"), ("csv", "完整索引")]
                                + ([("unverified", "日期待核实清单")] if state else [])]

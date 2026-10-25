@@ -83,6 +83,11 @@ def _owner_connection(connection):
         connection.commit()
         if not acquired:
             raise ValueError("请先停止 worker；已有 worker 或历史修复进程持有运行锁")
+        if not connection.execute(text("SELECT pg_try_advisory_lock(86221026)")).scalar():
+            connection.execute(text("SELECT pg_advisory_unlock(86221025)"))
+            connection.commit()
+            raise ValueError("请先停止 publisher；发布进程持有运行锁")
+        connection.commit()
     else:
         # SQLite is only used in tests/development; an OS lock excludes CLI replicas.
         import os
@@ -108,6 +113,7 @@ def _owner_connection(connection):
         yield
     finally:
         if connection.dialect.name == "postgresql":
+            connection.execute(text("SELECT pg_advisory_unlock(86221026)"))
             connection.execute(text("SELECT pg_advisory_unlock(86221025)"))
             connection.commit()
         else:
@@ -162,6 +168,8 @@ def cleanup_one(db, value):
     if root.exists():
         shutil.rmtree(root)
     items = select(BatchItem.id).where(BatchItem.batch_id == identity)
+    from .publications import cleanup
+    cleanup(db, identity)
     db.execute(delete(Delivery).where(Delivery.batch_id == identity))
     db.execute(delete(ReportCandidate).where(ReportCandidate.batch_id == identity))
     db.execute(delete(ReportSelection).where(ReportSelection.item_id.in_(items)))

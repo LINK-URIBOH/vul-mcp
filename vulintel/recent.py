@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import httpx
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 
 from .collector import FILE_LIMIT, error_details, failure_schedule
 from .config import settings
@@ -310,6 +310,7 @@ def page(source, stage, transport=None, heartbeat=None):
             upstream.close()
     root = _snapshot_root(stage.run_id, stage.id, cursor.get("cycle", 0))
     upstream = SnapshotUpstream(root, transport=transport, heartbeat=callback)
+    upstream.initial_window = stage.initial
     records, used, consumed, exhausted = [], 0, 0, False
     stream = upstream.records(source, stage.start_at, stage.end_at)
     try:
@@ -455,7 +456,10 @@ def verify_once(transport=None, heartbeat=None):
             RecentCandidate.run_id == run_id, Source.enabled.is_(True),
             RecentCandidate.status.in_(["pending", "lookup", "unverified", "conflict", "error"]),
             or_(RecentCandidate.retry_at.is_(None), RecentCandidate.retry_at <= now()))
-            .order_by(RecentCandidate.updated_at, RecentCandidate.id).limit(1))
+            .order_by(case((RecentCandidate.data["severity"].as_string() == "critical", 0),
+                           (or_(RecentCandidate.data["severity"].as_string() == "unknown",
+                                RecentCandidate.data["severity"].as_string().is_(None)), 1), else_=2),
+                      RecentCandidate.updated_at, RecentCandidate.id).limit(1))
         if not row:
             _settle(db, run_id)
             db.commit()
