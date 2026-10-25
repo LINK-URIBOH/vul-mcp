@@ -60,7 +60,8 @@ async def transaction(function, *args):
             raw = str(exc) if isinstance(exc, ValueError) else ""
             from .maintenance import BLOCKED
             from .publication import DATES_BLOCKED, DATES_MISSING
-            known = (*known, BLOCKED, DATES_BLOCKED, DATES_MISSING,
+            from .recent_reset import BLOCKED as RESET_BLOCKED
+            known = (*known, BLOCKED, DATES_BLOCKED, DATES_MISSING, RESET_BLOCKED,
                      "未发布批次仍使用旧日期规则，请运行 repair-publication-dates --rebuild-unpublished")
             message = raw if raw in known or re.fullmatch(r"仍有\d+条记录需要完成逐条详解", raw) else "服务端处理失败或参数无效，请核对服务日志"
             raise ToolError(f"{message[:240]}；追踪编号 {correlation}") from None
@@ -94,6 +95,8 @@ def make_mcp(verifier=None):
         result["maintenance"] = await transaction(progress)
         from .publication import coverage
         result["date_coverage"] = await transaction(coverage)
+        from .recent import progress as bootstrap_progress
+        result["bootstrap"] = await transaction(bootstrap_progress)
         logging.getLogger("vulintel").info(json.dumps({"event": "health_check", "result": result}))
         return result
 
@@ -102,7 +105,9 @@ def make_mcp(verifier=None):
         """Show enabled sources, last successful collection and coverage failures."""
         principal("vul.read")
         from .publication import coverage
-        return {"sources": await transaction(source_status), "date_coverage": await transaction(coverage)}
+        from .recent import progress as bootstrap_progress
+        return {"sources": await transaction(source_status), "date_coverage": await transaction(coverage),
+                "bootstrap": await transaction(bootstrap_progress)}
 
     @server.tool(annotations=WRITE, structured_output=True)
     async def open_report_batch(slot: str | None = None) -> dict[str, Any]:

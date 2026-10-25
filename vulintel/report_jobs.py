@@ -79,6 +79,7 @@ def status(db, batch):
             "current_new_disclosures": state.new_count - state.work.get("backlog_new", 0),
             "recent_important_updates": state.update_count - state.work.get("backlog_updates", 0),
             "date_coverage": state.work.get("date_coverage"),
+            "bootstrap": state.work.get("bootstrap"),
             "retry_after_seconds": 30 if batch.status in {"preparing", "rendering"} else None,
             "metadata_backfill": metadata.value if metadata else {"complete": False}}
 
@@ -135,9 +136,10 @@ def prepare_step(db, batch, state):
         select_step(db, batch, state)
         return
     if state.watermark is None:
+        from .recent import progress as bootstrap_progress
         state.watermark = db.scalar(select(func.max(Revision.id))) or 0
         state.work = {**state.work, "date_watermark": db.scalar(select(func.max(PublicationAnnotation.id))) or 0,
-                      "date_coverage": coverage(db)}
+                      "date_coverage": coverage(db), "bootstrap": bootstrap_progress(db)}
     other = aliased(Revision)
     later_annotation = aliased(PublicationAnnotation)
     start = batch.cutoff - timedelta(days=7)

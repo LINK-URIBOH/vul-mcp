@@ -22,7 +22,8 @@ log = logging.getLogger("vulintel.maintenance")
 
 def progress(db):
     from .publication import REPAIR_KEY
-    row = db.get(MetadataState, REPAIR_KEY) or db.get(MetadataState, KEY)
+    from .recent_reset import KEY as RESET_KEY
+    row = db.get(MetadataState, RESET_KEY) or db.get(MetadataState, REPAIR_KEY) or db.get(MetadataState, KEY)
     if not row:
         return None
     value = dict(row.value)
@@ -37,8 +38,9 @@ def progress(db):
 
 def active(db):
     from .publication import REPAIR_KEY
-    return any(row and not row.value.get("complete") for row in
-               (db.get(MetadataState, KEY), db.get(MetadataState, REPAIR_KEY)))
+    from .recent_reset import KEY as RESET_KEY
+    return any(row and not row.value.get("complete") and not row.value.get("superseded_by") for row in
+               (db.get(MetadataState, KEY), db.get(MetadataState, REPAIR_KEY), db.get(MetadataState, RESET_KEY)))
 
 
 def report_write_guard(db):
@@ -47,6 +49,10 @@ def report_write_guard(db):
     if db.bind.dialect.name == "postgresql":
         db.execute(text("SELECT pg_advisory_xact_lock(86221023)"))
     if active(db):
+        from .recent_reset import BLOCKED as RESET_BLOCKED, KEY as RESET_KEY
+        reset = db.get(MetadataState, RESET_KEY)
+        if reset and not reset.value.get("complete"):
+            raise ValueError(RESET_BLOCKED)
         from .publication import DATES_BLOCKED, REPAIR_KEY
         row = db.get(MetadataState, REPAIR_KEY)
         if row and not row.value.get("complete"):

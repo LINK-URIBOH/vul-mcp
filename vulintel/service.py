@@ -22,7 +22,7 @@ def audit(db, actor, action, target):
     db.add(Audit(actor=actor[:200], action=action, target=str(target)[:200]))
 
 
-def ingest(db, source_id, data, *, maintenance=False):
+def ingest(db, source_id, data, *, maintenance=False, observed=None):
     """Idempotent source records; aliases link CVEs, never a bulletin's mentioned CVEs."""
     data = {**data, "aliases": record_aliases(data)}
     source_key = data["source_key"][:240]
@@ -97,10 +97,10 @@ def ingest(db, source_id, data, *, maintenance=False):
     if not maintenance:
         vuln.updated_at = now()
         from .timeline import append_revision
-        revision = append_revision(db, vuln, previous=previous)
+        revision = append_revision(db, vuln, previous=previous, observed=observed)
         db.flush()
         from .publication import annotate, project_revision
-        annotate(db, vuln, assessed=revision.observed_at)
+        annotate(db, vuln, assessed=now() if observed else revision.observed_at)
         project_revision(db, revision, derived=revision)
         pending = db.get(ReportBacklog, vuln.id)
         if pending:
@@ -113,13 +113,28 @@ def ingest(db, source_id, data, *, maintenance=False):
 def source_status(db):
     progress = {s.key.split(":", 1)[1]: s.value for s in db.scalars(
         select(MetadataState).where(MetadataState.key.like("source-progress:%")))}
+    from .recent import enabled
+    from .db import RecentSource
+    from .recent_reset import KEY
+    run = db.get(MetadataState, KEY)
+    stages = {stage.source_id: stage for stage in db.scalars(select(RecentSource).where(
+        RecentSource.run_id == run.value["run_id"]))} if enabled(db) else {}
+    for stage in stages.values():
+        progress[stage.source_id] = {"status": stage.status, "processed": stage.processed,
+            "completed_at": stage.updated_at.isoformat() + "Z" if stage.status == "idle" else None,
+            "heartbeat_at": stage.updated_at.isoformat() + "Z", "coverage_mode": stage.mode}
     return [{"id": s.id, "name": s.name, "enabled": s.enabled,
              "last_success_utc": s.last_success.isoformat() + "Z" if s.last_success else None,
              "last_attempt_utc": s.last_attempt.isoformat() + "Z" if s.last_attempt else None,
              "next_run_utc": s.next_run.isoformat() + "Z" if s.next_run else None,
              "progress": progress.get(s.id, {}),
+             "coverage_mode": stages[s.id].mode if s.id in stages else "standard",
+             "coverage_limited": s.id in stages and stages[s.id].mode == "targeted",
+             "coverage_note": "定向补充／首次覆盖有限，不执行历史索引回灌" if s.id in stages and stages[s.id].mode == "targeted" else None,
+             "bootstrap_status": stages[s.id].status if s.id in stages else None,
              "error": s.error,
-             "stale": not s.last_success or (now() - s.last_success) > timedelta(hours=2)}
+             "stale": (not s.last_success or (now() - s.last_success) > timedelta(hours=2))
+                      if s.id not in stages or stages[s.id].mode != "targeted" else False}
             for s in db.scalars(select(Source).order_by(Source.id))]
 
 

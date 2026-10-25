@@ -48,3 +48,9 @@ def migration_004(connection):
                                   "REFERENCES publication_annotations(id)")
     if "reason" not in columns:
         connection.exec_driver_sql("ALTER TABLE unverified_report_items ADD COLUMN reason VARCHAR(80)")
+
+
+def migration_005(connection):
+    from .db import RecentCandidate, RecentSource
+    for table in [RecentSource, RecentCandidate]:
+        table.__table__.create(connection, checkfirst=True)

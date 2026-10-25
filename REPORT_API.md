@@ -2,6 +2,14 @@
 
 ## 服务器状态
 
+v1.4.0 增加显式 `reset-recent --days 7 --clear-vulnerabilities --clear-reports`（服务器CLI，不增加MCP工具）。迁移005增加独立候选及来源扫描水位；重置范围、恢复和幂等说明见 [升级文档](UPGRADE_v1.4.0.md)。普通升级不自动切换或清库。
+
+近七天模式下 `health_check`、`get_source_status` 返回 `bootstrap`：固定window_start/end、phase、scan_complete、candidates、processed、verified_candidates、admitted_vulnerabilities、excluded_old、unverified、conflicts、pending、errors、status、updated_at、heartbeat_at、items_per_hour、percent、estimated_remaining_seconds和sources。来源发现总量未知时percent/ETA为null；队列ETA不包含未来新增、所有来源覆盖或延期重试。
+
+`get_source_status.sources` 增加 coverage_mode（published/events/targeted）、coverage_limited、coverage_note、bootstrap_status。targeted不是当前来源失败，也不是已完成全量采集；last_success为空且coverage_limited=true仍表示覆盖有限。来源启停配置保留。
+
+正式库只接收通过日期资格核实的首次候选，暂存未知/冲突记录独立展示。后续新证据纠正已有正式记录时保留事实并更新规范标注。`get_report_status` 和归档 `report_scope` 增加准备时冻结的bootstrap快照；暂存候选数量与本批candidate_total、total、unverified_dates不同，不能相加当作已核实新增。候选完整证据及失败原因可在管理页 `/admin/recent-candidates` 查看。网络补证不持有维护屏障，第一阶段尚未覆盖的来源明确列示。
+
 批次状态为 preparing、analyzing、rendering、finalized、failed。仅 finalized 可下载正式文件。get_report_status 返回 policy、ready、total、analyzed、pending_analysis、new_disclosures、important_updates、unverified_dates、metadata_backfill、phase、render_stage、rendered_items、coverage_at_utc、error；准备前未知计数为 null，不是零。
 
 旧批次 policy=1、legacy=true，v1.1.0 为2，v1.1.1 为3，v1.2.0 为4，v1.3.0 为5；时间段仍唯一。旧的未发布批次拒绝沿用旧日期规则，须先运行 `repair-publication-dates --rebuild-unpublished`。该工具重置首次启动冻结的未发布批次（同一批次编号、时间段和上限），清除这些批次的分析及暂存文件，修复完成后重新准备；已归档报告不改写。完成后重跑不清理后来生成的报告。旧 `repair-history --clear-reports` 仍是清理全部报告的独立工具，不代替日期修复。

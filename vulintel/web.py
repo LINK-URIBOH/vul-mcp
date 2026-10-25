@@ -28,7 +28,9 @@ STATUS_LABELS = {"critical": "严重", "high": "高危", "medium": "中危", "lo
                  "running": "运行中", "done": "完成", "analyzing": "分析中", "finalized": "已归档",
                  "preparing": "准备中", "rendering": "生成文件中", "staged": "待统一发布",
                  "email": "邮件", "webhook": "Webhook"}
-STATUS_LABELS.update(maintenance="历史修复", publication="公开日期补证", interrupted="已中断／等待恢复")
+STATUS_LABELS.update(maintenance="历史修复", publication="公开日期补证", bootstrap="近七天初始化",
+                     superseded="已被重置取代", interrupted="已中断／等待恢复", admitted="已核实入库",
+                     excluded="已排除", unverified="日期待核实", conflict="日期冲突", lookup="定向补充", error="补证错误")
 TEMPLATES.filters["statuslabel"] = lambda value: STATUS_LABELS.get(value, value) if isinstance(value, str) else value
 
 
@@ -295,7 +297,7 @@ async def sources(request):
         return page(request, identity, "采集来源", columns=["来源", "状态", "成功窗口终点（UTC）", "实际完成（UTC）", "任务进度", "下次采集/重试（UTC）", "错误"],
                     rows=[{"cells": [s.name, "启用" if s.enabled else "停用", s.last_success or "尚未采集",
                                       status_map[s.id]["progress"].get("completed_at", "尚无实际完成记录"),
-                                      str(status_map[s.id]["progress"].get("status", "—")) + " / " + str(status_map[s.id]["progress"].get("processed", 0)),
+                                      status_map[s.id]["coverage_note"] or str(status_map[s.id].get("bootstrap_status") or status_map[s.id]["progress"].get("status", "—")),
                                       s.next_run if s.enabled else "—", s.error or "—"],
                            "actions": [{"label": "停用" if s.enabled else "启用", "url": f"/admin/actions/source/{s.id}/toggle"},
                                        {"label": "补采", "url": f"/admin/actions/source/{s.id}/collect"}]} for s in values])
@@ -311,8 +313,9 @@ async def tasks(request):
         events = list(db.scalars(select(Audit).order_by(Audit.id.desc()).limit(30)))
         from .maintenance import progress
         maintenance = progress(db)
+        from .recent import progress as bootstrap_progress
         return page(request, identity, "任务与操作记录", columns=["任务", "来源", "状态", "创建时间（UTC）", "错误"],
-                    maintenance=maintenance,
+                    maintenance=maintenance, bootstrap=bootstrap_progress(db),
                     rows=[{"cells": [j.kind, j.source_id or "—",
                                      maintenance["status"] if j.kind == "maintenance" and maintenance and j.id == maintenance["job_id"] else j.status,
                                      j.created_at, j.error or "—"],
@@ -320,6 +323,43 @@ async def tasks(request):
                            if j.status == "failed" and j.kind != "maintenance" else []}
                           for j in jobs[:100]], events=events,
                     next_url=f"?offset={offset + 100}" if len(jobs) > 100 else None)
+
+
+async def recent_candidates(request):
+    from .db import RecentCandidate
+    with session() as db:
+        identity = admin_session(request, db)
+        if not identity:
+            return RedirectResponse("/admin/login", status_code=303)
+        offset = offset_page(request)
+        query = select(RecentCandidate)
+        selected_status = request.query_params.get("status")
+        if selected_status:
+            if selected_status not in {"pending", "lookup", "unverified", "conflict", "error", "excluded", "admitted"}:
+                raise HTTPException(400, "无效候选状态")
+            query = query.where(RecentCandidate.status == selected_status)
+        values = list(db.scalars(query.order_by(RecentCandidate.updated_at.desc(), RecentCandidate.id).offset(offset).limit(51)))
+        return page(request, identity, "候选核实清单（独立于正式漏洞库）", columns=["来源", "编号", "标题", "状态", "原因", "取得事实时间（UTC）"],
+                    rows=[{"cells": [row.source_id, row.source_key, row.data.get("title", "待获取详情"), row.status,
+                                      row.reason or "—", row.collected_at], "link": "/admin/recent-candidates/" + row.id} for row in values[:50]],
+                    next_url="?" + urlencode({"offset": offset + 50, **({"status": selected_status} if selected_status else {})}) if len(values) > 50 else None)
+
+
+async def recent_candidate_detail(request):
+    from .db import RecentCandidate
+    with session() as db:
+        identity = admin_session(request, db)
+        if not identity:
+            return RedirectResponse("/admin/login", status_code=303)
+        row = db.get(RecentCandidate, request.path_params["cid"])
+        if row is None:
+            raise HTTPException(404)
+        return page(request, identity, "候选 · " + row.source_key,
+                    summary=row.reason or "已核实入库" if row.status == "admitted" else row.reason or "正在补证",
+                    detail=json.dumps({"source_facts": row.data, "date_annotation": row.annotation,
+                        "status": row.status, "reason": row.reason, "collected_at": row.collected_at.isoformat(),
+                        "window_start": row.start_at.isoformat(), "window_end": row.end_at.isoformat(),
+                        "evidence_cursor": row.evidence_cursor}, ensure_ascii=False, indent=2))
 
 
 async def deliveries(request):
@@ -403,4 +443,5 @@ def routes():
             Route("/admin/reports/{bid}/download/{kind}", download), Route("/admin/reports/{bid}/view", report_view),
             Route("/admin/reports/{bid}", report_detail),
             Route("/admin/sources", sources), Route("/admin/tasks", tasks), Route("/admin/deliveries", deliveries),
+            Route("/admin/recent-candidates", recent_candidates), Route("/admin/recent-candidates/{cid}", recent_candidate_detail),
             Route("/admin/actions/{kind}/{target}/{operation}", action, methods=["POST"])]

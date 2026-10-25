@@ -105,6 +105,9 @@ def render_step(db, batch, state):
         append(root, work, "report.html", '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>漏洞情报报告</title>'
                f'<style>body{{margin:0;background:#f4f7fa;font-family:{FONT}}}p,li{{overflow-wrap:anywhere}} @media(max-width:600px){{h1{{font-size:23px}}}}</style></head><body>' + header(batch, state) + "<h2>漏洞详情</h2>")
         append(root, work, "report.md", f"# 漏洞情报报告\n\n报告编号：{batch.id}\n\n时间段：{batch.slot}\n\n{scope_text(state)}\n\n公开日期待核实 {state.unknown_count} 条。\n\n")
+        bootstrap = state.work.get("bootstrap")
+        if bootstrap:
+            append(root, work, "report.md", f'分阶段采集：暂存候选待核实 {bootstrap["unverified"]} 条、日期冲突 {bootstrap["conflicts"]} 条、待补证 {bootstrap["pending"]} 条；独立于正式库和本批合格候选。定向来源覆盖有限，不代表全部来源已扫描。候选核实清单见管理页。\n\n')
         for key, label in [("risk_summary", "核心风险"), ("repair_priorities", "优先修复建议")]:
             if state.overview.get(key):
                 append(root, work, "report.md", f"## {label}\n\n" + "".join(f"- {ESC(v)}\n" for v in state.overview[key]) + "\n")
@@ -195,7 +198,7 @@ def render_step(db, batch, state):
         if not rows:
             append(root, work, "report.html", "</ul>" + coverage(batch, state) + '<h2>日期待核实清单</h2><p>以下记录未混入近期公开；完整清单另存 unverified.csv。</p><ul>')
             append(root, work, "report.md", "\n## 采集覆盖\n\n" + f"快照时间：{iso(state.coverage_at)}\n\n" + "".join(
-                f'- {ESC(s["name"])}：' + ("停用" if not s["enabled"] else "失败" if s["error"] else "过期" if s["stale"] else "正常") + "\n" for s in batch.coverage) + "\n## 日期待核实清单\n\n")
+                f'- {ESC(s["name"])}：' + ("停用" if not s["enabled"] else "覆盖有限／定向补充" if s.get("coverage_limited") else "失败" if s["error"] else "过期" if s["stale"] else "正常") + "\n" for s in batch.coverage) + "\n## 日期待核实清单\n\n")
             work.update(phase="unknown", unknown_cursor=0)
     elif phase == "unknown":
         identities = list(db.scalars(select(UnverifiedItem.id).where(UnverifiedItem.batch_id == batch.id,

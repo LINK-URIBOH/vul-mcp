@@ -43,6 +43,14 @@ def work_once():
         from .maintenance import active
         if active(db):
             return False
+        from .recent import enabled
+        recent_mode = enabled(db)
+    if recent_mode:
+        from .recent import discover_once, verify_once
+        discovered = discover_once(heartbeat=touch_heartbeat)
+        verified = verify_once(heartbeat=touch_heartbeat)
+        return discovered or verified
+    with session() as db:
         for stale in db.scalars(select(Job).where(Job.kind == "collect", Job.status == "running", Job.lease_until < now())):
             stale.status, stale.error = "failed", "工作进程中断或租约过期，请重试"
         db.commit()
@@ -94,7 +102,7 @@ def main():
         lock.commit()
     with session() as db:
         for interrupted in db.scalars(select(Job).where(Job.status == "running", Job.kind != "maintenance")):
-            interrupted.status = "pending" if interrupted.kind in {"report", "publication"} else "failed"
+            interrupted.status = "pending" if interrupted.kind in {"report", "publication", "bootstrap"} else "failed"
             interrupted.lease_until = None
             interrupted.error = None if interrupted.kind in {"report", "publication"} else "上次工作进程中断，请重试"
             if interrupted.kind == "collect":

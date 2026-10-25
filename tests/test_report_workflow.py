@@ -265,7 +265,7 @@ def test_additive_migration_keeps_old_archives_and_is_idempotent(store):
     database.migrate()
     with store() as db:
         assert db.get(Batch, old.id).summary == "旧报告"
-        assert db.scalar(select(func.count()).select_from(Migration)) == 4
+        assert db.scalar(select(func.count()).select_from(Migration)) == 5
 
 
 def test_historical_kev_import_does_not_become_today_update(store, cutoff):

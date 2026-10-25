@@ -265,6 +265,47 @@ class DateEvidenceCache(Base):
     data: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class RecentSource(Base):
+    __tablename__ = "recent_sources"
+    __table_args__ = (UniqueConstraint("run_id", "source_id"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    run_id: Mapped[str] = mapped_column(String(36), index=True)
+    source_id: Mapped[str] = mapped_column(ForeignKey("sources.id"))
+    mode: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    start_at: Mapped[datetime] = mapped_column(DateTime)
+    end_at: Mapped[datetime] = mapped_column(DateTime)
+    initial: Mapped[bool] = mapped_column(Boolean, default=True)
+    cursor: Mapped[dict] = mapped_column(JSON, default=dict)
+    processed: Mapped[int] = mapped_column(Integer, default=0)
+    total: Mapped[int | None] = mapped_column(Integer)
+    next_run: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    error: Mapped[str | None] = mapped_column(Text)
+
+
+class RecentCandidate(Base):
+    __tablename__ = "recent_candidates"
+    __table_args__ = (UniqueConstraint("run_id", "source_id", "source_key"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    run_id: Mapped[str] = mapped_column(String(36), index=True)
+    source_id: Mapped[str] = mapped_column(ForeignKey("sources.id"))
+    source_key: Mapped[str] = mapped_column(String(240))
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    initial: Mapped[bool] = mapped_column(Boolean, default=True)
+    data: Mapped[dict] = mapped_column(JSON)
+    annotation: Mapped[dict] = mapped_column(JSON, default=dict)
+    evidence_cursor: Mapped[dict] = mapped_column(JSON, default=dict)
+    start_at: Mapped[datetime] = mapped_column(DateTime)
+    end_at: Mapped[datetime] = mapped_column(DateTime)
+    collected_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    retry_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    vulnerability_id: Mapped[str | None] = mapped_column(String(36))
+    reason: Mapped[str | None] = mapped_column(Text)
+
+
 def build_engine(url):
     kwargs = {"pool_pre_ping": True}
     if not url.startswith("sqlite"):
@@ -296,7 +337,7 @@ def migrate():
         from sqlalchemy import select
         Migration.__table__.create(conn, checkfirst=True)
         versions = set(conn.execute(select(Migration.version)).scalars())
-        if versions - {1, 2, 3, 4} or any(v in versions and v - 1 not in versions for v in (2, 3, 4)):
+        if versions - {1, 2, 3, 4, 5} or any(v in versions and v - 1 not in versions for v in (2, 3, 4, 5)):
             raise ValueError("数据库迁移版本不兼容，拒绝自动修改")
         if 1 not in versions:
             for table in [Source, Vulnerability, Alias, SourceRecord, Batch, BatchItem, Delivery,
@@ -315,3 +356,7 @@ def migrate():
             from .migrations import migration_004
             migration_004(conn)
             conn.execute(Migration.__table__.insert().values(version=4, applied=now()))
+        if 5 not in versions:
+            from .migrations import migration_005
+            migration_005(conn)
+            conn.execute(Migration.__table__.insert().values(version=5, applied=now()))

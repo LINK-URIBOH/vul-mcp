@@ -2,14 +2,21 @@
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ title }} · 漏洞情报</title><link rel="stylesheet" href="/static/admin.css"></head>
 <body><a class="skip" href="#main">跳到正文</a><aside><a class="brand" href="/admin/">漏洞情报<span>采集 · 核实 · 处置</span></a>
-<nav aria-label="主导航">{% for url,label in [('/admin/','工作台'),('/admin/vulnerabilities','漏洞索引'),('/admin/reports','报告归档'),('/admin/sources','采集来源'),('/admin/tasks','任务记录'),('/admin/deliveries','投递记录')] %}
+<nav aria-label="主导航">{% for url,label in [('/admin/','工作台'),('/admin/vulnerabilities','漏洞索引'),('/admin/recent-candidates','候选核实'),('/admin/reports','报告归档'),('/admin/sources','采集来源'),('/admin/tasks','任务记录'),('/admin/deliveries','投递记录')] %}
 <a href="{{ url }}" {% if path == url %}aria-current="page"{% endif %}>{{ label }}</a>{% endfor %}</nav>
 <div class="aside-note">公开信息需结合你的产品版本核实。<br>日期筛选按北京时间；仅到日的来源保留原始精度，边界不确定时另列待核实。</div>
 <form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="logout">退出管理页</button></form></aside>
 <main id="main"><header><p class="section-name">漏洞情报管理</p><h1>{{ title }}</h1><p>重点查看已利用漏洞、待完成报告和失败任务。</p></header>
 {% if stats %}<dl class="stats">{% for key,value in stats.items() %}<div><dt>{{ key }}</dt><dd>{{ value }}</dd></div>{% endfor %}</dl>{% endif %}
-{% if maintenance %}<section class="summary"><h2>历史数据修复</h2>
-<p>状态：{{ maintenance.status|statuslabel }}；阶段：{{ {'cleanup':'清理旧报告','rebuild':'重建未发布批次','annotating':'公开日期补证和重标','enqueue':'恢复报告队列','aliases':'标识归并','events':'历史事件重算','validation':'一致性校验','complete':'完成'}.get(maintenance.phase, maintenance.phase) }}。</p>
+{% if bootstrap %}<section class="summary"><h2>近七天分阶段初始化</h2>
+<p>固定窗口：{{ bootstrap.window_start }} 至 {{ bootstrap.window_end }}（UTC）；阶段：{{ {'cleanup':'清理','discovering':'候选发现','verifying':'日期核实','scan_complete':'初始化扫描完成'}.get(bootstrap.phase,bootstrap.phase) }}。</p>
+<p>候选 {{ bootstrap.candidates }}；已核实候选 {{ bootstrap.verified_candidates }}；正式漏洞 {{ bootstrap.admitted_vulnerabilities }}；旧记录排除 {{ bootstrap.excluded_old }}；日期待核实 {{ bootstrap.unverified }}；冲突 {{ bootstrap.conflicts }}；待补证 {{ bootstrap.pending }}；补证错误 {{ bootstrap.errors }}。</p>
+<p>扫描完成：{{ '是' if bootstrap.scan_complete else '否' }}，与日期是否全部核实分开统计。联网补证不阻塞报告。<a href="/admin/recent-candidates">查看候选证据和失败原因</a>。</p>
+<p>最近更新 {{ bootstrap.updated_at }}；心跳 {{ bootstrap.heartbeat_at or '当前未运行网络步骤' }}；速度 {{ bootstrap.items_per_hour or '尚不能估算' }} 条/小时；剩余 {{ bootstrap.estimated_remaining_seconds if bootstrap.estimated_remaining_seconds is not none else '总量或速度未知' }} 秒（估算）。</p>
+{% if bootstrap.percent is not none %}<p>当前已发现候选处理进度 {{ bootstrap.percent }}%，不代表全球来源覆盖率。</p>{% endif %}
+<details><summary>来源覆盖方式</summary><pre>{{ bootstrap.sources|tojson(indent=2) }}</pre></details></section>{% endif %}
+{% if maintenance %}<section class="summary"><h2>{{ '业务数据重置' if maintenance.run_id is defined else '历史数据修复' }}</h2>
+<p>状态：{{ maintenance.status|statuslabel }}；阶段：{{ {'cleanup':'清理旧报告','snapshots':'清理旧候选快照','tables':'清理漏洞及依赖数据','rebuild':'重建未发布批次','annotating':'公开日期补证和重标','enqueue':'恢复报告队列','aliases':'标识归并','events':'历史事件重算','validation':'一致性校验','complete':'完成'}.get(maintenance.phase, maintenance.phase) }}。</p>
 <p>{% if maintenance.rebuild_index is defined %}未发布批次已重置 {{ maintenance.rebuild_index }} 个{% else %}旧报告已清理 {{ maintenance.cleanup_index }} 个{% endif %}；更新时间：{{ maintenance.updated_at or maintenance.started_at }}。</p>
 {% if maintenance.heartbeat_at %}<p>最近进程心跳：{{ maintenance.heartbeat_at }}。</p>{% endif %}
 {% if maintenance.backfill %}<p>已扫描 {{ maintenance.backfill.get('alias_processed',0) }} 条来源，重新关联 {{ maintenance.backfill.get('relinked_records',0) }} 条；事件已处理 {{ maintenance.backfill.get('processed',0) }} 个漏洞。</p>{% endif %}
@@ -17,7 +24,7 @@
 {% if maintenance.after and maintenance.rebuild_index is defined %}<p>日期核实：已确认 {{ maintenance.after.confirmed }}；精确到日 {{ maintenance.after.day }}；未知 {{ maintenance.after.unknown }}；冲突 {{ maintenance.after.conflict }}；缺少当前标注 {{ maintenance.after.missing_current_annotation }}。扫描完成不代表每条日期均已确认。</p>{% endif %}
 {% if maintenance.processed is defined %}<p>已重标 {{ maintenance.processed }} 个漏洞；已校正 {{ maintenance.corrected_dates }} 个；历史投影 {{ maintenance.projections_written }} 条；补证网络缺口 {{ maintenance.network_gaps }} 个。</p>{% endif %}
 {% if maintenance.error %}<p class="warning">{{ maintenance.error }}</p>{% endif %}
-{% if not maintenance.complete %}<p>中断后在服务器运行相同的 {{ 'repair-publication-dates --rebuild-unpublished' if maintenance.rebuild_index is defined else 'repair-history --clear-reports' }} 命令恢复。维护完成前暂停报告与投递。</p>{% endif %}
+{% if not maintenance.complete %}<p>中断后在服务器运行相同的 {{ 'reset-recent --days 7 --clear-vulnerabilities --clear-reports' if maintenance.run_id is defined else 'repair-publication-dates --rebuild-unpublished' if maintenance.rebuild_index is defined else 'repair-history --clear-reports' }} 命令恢复。维护完成前暂停报告与投递。</p>{% endif %}
 {% if maintenance.after %}<details><summary>修复前后数量</summary><pre>{{ {'before':maintenance.before,'after':maintenance.after}|tojson(indent=2) }}</pre></details>{% endif %}
 </section>{% endif %}
 {% if delivery_enabled is defined and not delivery_enabled %}<p class="warning" role="status">自动投递尚未启用。完成 OAuth 与云端写入验证后，可配置邮件或 Webhook 中的一个或两个渠道，再开启投递总开关。</p>{% endif %}

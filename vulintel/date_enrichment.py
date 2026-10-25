@@ -1,6 +1,8 @@
 """Bounded, cached public date evidence. Upstream JSON/HTML is data, never code."""
 import json
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import timedelta
 from urllib.parse import urlsplit
 
@@ -15,6 +17,18 @@ from .publication import VERIFIED, annotate, cache_key, cve_ids, https_url, proo
 
 LIMIT = 2_000_000
 _last_request = 0.0
+_request_lock = threading.Lock()
+_flights_lock = threading.Lock()
+_flights = {}
+_network_slots = threading.BoundedSemaphore(4)
+
+
+def fetch_group(requests, transport=None, heartbeat=None):
+    """At most four in-flight requests across candidate and legacy evidence jobs."""
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(fetch_cached, url, identifier=identifier, transport=transport, heartbeat=heartbeat)
+                   for url, identifier in requests]
+        return [future.result() for future in futures]
 
 
 def allowed_reference(url):
@@ -69,6 +83,29 @@ def page_facts(content, url):
 
 
 def fetch_cached(url, *, identifier=None, transport=None, heartbeat=None):
+    key = (url, identifier)
+    with _flights_lock:
+        future = _flights.get(key)
+        owner = future is None
+        if owner:
+            future = Future()
+            _flights[key] = future
+    if not owner:
+        return future.result()
+    try:
+        with _network_slots:
+            data = _fetch_cached(url, identifier=identifier, transport=transport, heartbeat=heartbeat)
+        future.set_result(data)
+        return data
+    except BaseException as exc:
+        future.set_exception(exc)
+        raise
+    finally:
+        with _flights_lock:
+            _flights.pop(key, None)
+
+
+def _fetch_cached(url, *, identifier=None, transport=None, heartbeat=None):
     global _last_request
     if identifier is None and not allowed_reference(url):
         raise ValueError("日期补证地址未通过官方或研究者域名白名单")
@@ -81,8 +118,10 @@ def fetch_cached(url, *, identifier=None, transport=None, heartbeat=None):
             return cached.data
     client = CollectorHTTP(transport=transport, heartbeat=heartbeat)
     try:
-        client.pause(max(0, settings().publication_request_interval - (time.monotonic() - _last_request)))
-        _last_request = time.monotonic()
+        with _request_lock:
+            scheduled = max(time.monotonic(), _last_request + settings().publication_request_interval)
+            _last_request = scheduled
+        client.pause(max(0, scheduled - time.monotonic()))
         with client.downloaded(url, limit=LIMIT) as stream:
             raw = stream.read(LIMIT + 1)
         if len(raw) > LIMIT:
@@ -118,18 +157,10 @@ def enrich(vulnerability_id, transport=None, heartbeat=None):
             return
         data = dict(vuln.data)
     references = {url for url in data.get("references", []) if allowed_reference(url)}
-    for identifier in cve_ids(data):
-        if heartbeat:
-            heartbeat()
-        facts = fetch_cached("https://cveawg.mitre.org/api/cve/" + identifier, identifier=identifier,
-                             transport=transport, heartbeat=heartbeat)
+    requests = [("https://cveawg.mitre.org/api/cve/" + identifier, identifier) for identifier in cve_ids(data)]
+    for facts in fetch_group(requests, transport=transport, heartbeat=heartbeat):
         references.update(facts.get("references", []))
-    for reference in sorted(references):
-        # A valid CNA date does not establish that no earlier original advisory
-        # exists. Examine all linked, permitted originals before deciding.
-        if heartbeat:
-            heartbeat()
-        fetch_cached(reference, transport=transport, heartbeat=heartbeat)
+    fetch_group([(reference, None) for reference in sorted(references)], transport=transport, heartbeat=heartbeat)
     with session() as db:
         vuln = db.get(Vulnerability, vulnerability_id)
         if vuln:
