@@ -8,12 +8,12 @@ import threading
 import time
 from datetime import timedelta
 from types import SimpleNamespace
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import httpx
 from sqlalchemy import func, or_, select
 
-from .collector import CollectionError, FILE_LIMIT, error_details, failure_schedule
+from .collector import FILE_LIMIT, error_details, failure_schedule
 from .config import settings
 from .db import (Alias, DateEvidenceCache, Job, MetadataState, RecentCandidate, RecentSource, Revision,
                  Source, SourceRecord, Vulnerability, now, session)
@@ -25,6 +25,7 @@ from .sources import Upstream, ghsa_record, nvd_record, osv_record
 from .timeline import derive_revision, iso, stamp
 
 BYTE_LIMIT = 2_000_000
+MAX_CANDIDATE_BYTES = 8 * 1024 * 1024
 _touch_lock = threading.Lock()
 _last_touch = 0.0
 log = logging.getLogger("vulintel.recent")
@@ -45,6 +46,9 @@ def progress(db):
     sources = {source.id: source for source in db.scalars(select(Source))}
     counts = dict(db.execute(select(RecentCandidate.status, func.count()).where(
         RecentCandidate.run_id == run_id).group_by(RecentCandidate.status)).all())
+    oversized_by_source = dict(db.execute(select(RecentCandidate.source_id, func.count()).where(
+        RecentCandidate.run_id == run_id, RecentCandidate.status == "oversized")
+        .group_by(RecentCandidate.source_id)).all())
     active_sources = [stage for stage in stages if sources[stage.source_id].enabled and stage.mode == "published"]
     scan_complete = bool(value.get("complete") and all(not stage.initial for stage in active_sources))
     candidates = sum(counts.values())
@@ -63,6 +67,7 @@ def progress(db):
             "candidates": candidates, "processed": processed, "verified_candidates": counts.get("admitted", 0),
             "admitted_vulnerabilities": db.scalar(select(func.count()).select_from(Vulnerability)),
             "excluded_old": counts.get("excluded", 0), "unverified": counts.get("unverified", 0),
+            "oversized": counts.get("oversized", 0),
             "conflicts": counts.get("conflict", 0), "pending": pending, "errors": counts.get("error", 0),
             "updated_at": iso(latest), "heartbeat_at": iso(heartbeat),
             "status": ("interrupted" if job and job.status == "running" and job.lease_until and job.lease_until < now() else job.status if job else "queued"),
@@ -72,6 +77,7 @@ def progress(db):
             "sources": [{"id": stage.source_id, "enabled": sources[stage.source_id].enabled,
                          "mode": stage.mode, "status": stage.status, "initial_complete": not stage.initial,
                          "processed": stage.processed, "total": stage.total, "error": stage.error,
+                         "oversized": oversized_by_source.get(stage.source_id, 0),
                          "coverage": "定向补充／首次覆盖有限" if stage.mode == "targeted" else "按发布窗口发现候选；真实披露日期另行核实"}
                         for stage in stages]}
 
@@ -113,9 +119,10 @@ def offer(db, stage, record):
     if not isinstance(record, dict) or not record.get("source_key"):
         raise ValueError("初始化来源缺少稳定编号")
     encoded = json.dumps(record, ensure_ascii=False).encode()
-    if len(encoded) > BYTE_LIMIT:
-        raise CollectionError("recent_record_too_large", "单条初始化候选超过2MB预算")
     key = str(record["source_key"])[:240]
+    if len(encoded) > MAX_CANDIDATE_BYTES:
+        quarantine(db, stage, record, encoded)
+        return
     fingerprint = digest({k: v for k, v in record.items() if k != "modified"})
     row = db.scalar(select(RecentCandidate).where(RecentCandidate.run_id == stage.run_id,
                     RecentCandidate.source_id == stage.source_id, RecentCandidate.source_key == key))
@@ -143,6 +150,73 @@ def offer(db, stage, record):
     row.collected_at, row.updated_at, row.start_at, row.end_at = now(), now(), start, stage.end_at
     row.annotation, row.evidence_cursor, row.retry_at = {}, {}, None
     row.vulnerability_id = prior.id if prior else None
+
+
+def quarantine(db, stage, record, encoded):
+    """Save every byte before advancing; isolated rows never become analyses."""
+    fingerprint = hashlib.sha256(encoded).hexdigest()
+    root = _snapshot_root(stage.run_id, stage.id, stage.cursor.get("cycle", 0)) / "quarantine"
+    if root.is_symlink() or root.resolve().parent != root.parent.resolve():
+        raise ValueError("隔离目录超出受控范围")
+    root.mkdir(parents=True, exist_ok=True)
+    path, temporary = root / (fingerprint + ".json"), root / (fingerprint + ".part")
+    if path.is_symlink() or temporary.is_symlink():
+        raise ValueError("隔离文件不可为符号链接")
+    temporary.write_bytes(encoded)
+    temporary.replace(path)
+    key = str(record["source_key"])[:240]
+    row = db.scalar(select(RecentCandidate).where(RecentCandidate.run_id == stage.run_id,
+        RecentCandidate.source_id == stage.source_id, RecentCandidate.source_key == key))
+    if row is None:
+        row = RecentCandidate(run_id=stage.run_id, source_id=stage.source_id, source_key=key,
+                              fingerprint=fingerprint, data={}, start_at=stage.start_at, end_at=stage.end_at)
+        db.add(row)
+    row.fingerprint, row.status, row.initial = fingerprint, "oversized", stage.initial
+    row.data = {"source_key": key, "title": str(record.get("title", key))[:500],
+                "aliases": record.get("aliases", [])[:30], "references": record.get("references", [])[:30],
+                "evidence_complete": False, "title_complete": len(str(record.get("title", key))) <= 500,
+                "aliases_complete": len(record.get("aliases", [])) <= 30,
+                "references_complete": len(record.get("references", [])) <= 30,
+                "raw_artifact": {"relative_path": path.relative_to(settings().data_dir).as_posix(),
+                                 "sha256": fingerprint, "bytes": len(encoded)}}
+    row.annotation, row.evidence_cursor, row.retry_at = {}, {}, None
+    row.reason = f"单条候选{len(encoded)}字节超过8MiB上限；已隔离完整原文，待核查，未入库或分析"
+    row.collected_at, row.updated_at = now(), now()
+    row.start_at, row.end_at = stage.start_at, stage.end_at
+    log.warning("recent_candidate_quarantined source=%s key=%s bytes=%s", stage.source_id, key[:80], len(encoded))
+
+
+def raw_candidate_path(row):
+    """Only managed, intact quarantine artifacts can be served to an admin."""
+    from pathlib import Path
+    metadata = row.data.get("raw_artifact", {})
+    relative = Path(metadata.get("relative_path", ""))
+    root = settings().data_dir / "recent-snapshots" / row.run_id
+    path = settings().data_dir / relative
+    if relative.is_absolute() or path.is_symlink() or not path.resolve().is_relative_to(root.resolve()):
+        raise ValueError("候选原文路径超出受控范围")
+    for parent in path.parents:
+        if parent.is_symlink():
+            raise ValueError("候选原文路径包含符号链接")
+        if parent == settings().data_dir:
+            break
+    if not path.is_file() or path.stat().st_size != metadata.get("bytes"):
+        raise ValueError("候选原文缺失或大小校验失败")
+    checksum = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            checksum.update(chunk)
+    if checksum.hexdigest() != metadata.get("sha256"):
+        raise ValueError("候选原文校验失败")
+    return path
+
+
+def github_date_range(start, end):
+    # GitHub rejects fractional seconds. Expand the query to enclosing seconds;
+    # candidate admission still uses the original precise stored boundaries.
+    lower = start.replace(microsecond=0)
+    upper = end.replace(microsecond=0) + (timedelta(seconds=1) if end.microsecond else timedelta())
+    return iso(lower) + ".." + iso(upper)
 
 
 class SnapshotUpstream(Upstream):
@@ -218,7 +292,12 @@ def page(source, stage, transport=None, heartbeat=None):
             parsed = urlsplit(target)
             if parsed.scheme != "https" or parsed.hostname != "api.github.com" or parsed.port not in (None, 443) or parsed.username or parsed.password:
                 raise ValueError("GitHub初始化分页地址不属于官方HTTPS来源")
-            params = None if cursor.get("url") else {"published" if stage.initial else "modified": iso(stage.start_at) + ".." + iso(stage.end_at),
+            date_range = github_date_range(stage.start_at, stage.end_at)
+            if cursor.get("url"):
+                pairs = [(key, date_range if key in {"published", "modified", "updated"} else value)
+                         for key, value in parse_qsl(parsed.query, keep_blank_values=True)]
+                target = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(pairs), parsed.fragment))
+            params = None if cursor.get("url") else {"published" if stage.initial else "modified": date_range,
                                                    "sort": "published", "direction": "asc", "per_page": 100}
             token = settings().github_token.get_secret_value()
             headers = {"Accept": "application/vnd.github+json"}
@@ -326,7 +405,9 @@ def discover_once(transport=None, heartbeat=None):
         log.exception("recent_discovery_failed stage=%s", stage_id)
         with session() as db:
             stage = db.get(RecentSource, stage_id)
-            stage.status, stage.error, stage.updated_at = "failed", error_details(exc)["reason"], now()
+            details = error_details(exc)
+            reason = details["reason"] + (f"（HTTP {details['status']}）" if details.get("status") else "")
+            stage.status, stage.error, stage.updated_at = "failed", reason, now()
             stage.next_run = max(now() + timedelta(seconds=60), failure_schedule(exc))
             source = db.get(Source, stage.source_id)
             source.error, source.next_run = stage.error, stage.next_run

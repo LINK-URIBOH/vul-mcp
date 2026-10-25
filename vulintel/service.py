@@ -119,6 +119,11 @@ def source_status(db):
     run = db.get(MetadataState, KEY)
     stages = {stage.source_id: stage for stage in db.scalars(select(RecentSource).where(
         RecentSource.run_id == run.value["run_id"]))} if enabled(db) else {}
+    from .db import RecentCandidate
+    from sqlalchemy import func
+    oversized = dict(db.execute(select(RecentCandidate.source_id, func.count()).where(
+        RecentCandidate.run_id == run.value["run_id"], RecentCandidate.status == "oversized")
+        .group_by(RecentCandidate.source_id)).all()) if stages else {}
     for stage in stages.values():
         progress[stage.source_id] = {"status": stage.status, "processed": stage.processed,
             "completed_at": stage.updated_at.isoformat() + "Z" if stage.status == "idle" else None,
@@ -129,8 +134,10 @@ def source_status(db):
              "next_run_utc": s.next_run.isoformat() + "Z" if s.next_run else None,
              "progress": progress.get(s.id, {}),
              "coverage_mode": stages[s.id].mode if s.id in stages else "standard",
-             "coverage_limited": s.id in stages and stages[s.id].mode == "targeted",
-             "coverage_note": "定向补充／首次覆盖有限，不执行历史索引回灌" if s.id in stages and stages[s.id].mode == "targeted" else None,
+             "coverage_limited": bool(s.id in stages and stages[s.id].mode == "targeted" or oversized.get(s.id)),
+             "oversized_candidates": oversized.get(s.id, 0),
+             "coverage_note": (f"超大候选已隔离{oversized[s.id]}条，完整原文待核查" if oversized.get(s.id) else
+                              "定向补充／首次覆盖有限，不执行历史索引回灌" if s.id in stages and stages[s.id].mode == "targeted" else None),
              "bootstrap_status": stages[s.id].status if s.id in stages else None,
              "error": s.error,
              "stale": (not s.last_success or (now() - s.last_success) > timedelta(hours=2))

@@ -31,6 +31,7 @@ STATUS_LABELS = {"critical": "严重", "high": "高危", "medium": "中危", "lo
 STATUS_LABELS.update(maintenance="历史修复", publication="公开日期补证", bootstrap="近七天初始化",
                      superseded="已被重置取代", interrupted="已中断／等待恢复", admitted="已核实入库",
                      excluded="已排除", unverified="日期待核实", conflict="日期冲突", lookup="定向补充", error="补证错误")
+STATUS_LABELS["oversized"] = "超大条目待核查"
 TEMPLATES.filters["statuslabel"] = lambda value: STATUS_LABELS.get(value, value) if isinstance(value, str) else value
 
 
@@ -335,7 +336,7 @@ async def recent_candidates(request):
         query = select(RecentCandidate)
         selected_status = request.query_params.get("status")
         if selected_status:
-            if selected_status not in {"pending", "lookup", "unverified", "conflict", "error", "excluded", "admitted"}:
+            if selected_status not in {"pending", "lookup", "unverified", "conflict", "error", "excluded", "admitted", "oversized"}:
                 raise HTTPException(400, "无效候选状态")
             query = query.where(RecentCandidate.status == selected_status)
         values = list(db.scalars(query.order_by(RecentCandidate.updated_at.desc(), RecentCandidate.id).offset(offset).limit(51)))
@@ -356,10 +357,29 @@ async def recent_candidate_detail(request):
             raise HTTPException(404)
         return page(request, identity, "候选 · " + row.source_key,
                     summary=row.reason or "已核实入库" if row.status == "admitted" else row.reason or "正在补证",
+                    downloads=[{"label": "完整原始JSON（超大条目，尚未核查）", "url": "/admin/recent-candidates/" + row.id + "/raw"}]
+                              if row.status == "oversized" else [],
                     detail=json.dumps({"source_facts": row.data, "date_annotation": row.annotation,
                         "status": row.status, "reason": row.reason, "collected_at": row.collected_at.isoformat(),
                         "window_start": row.start_at.isoformat(), "window_end": row.end_at.isoformat(),
                         "evidence_cursor": row.evidence_cursor}, ensure_ascii=False, indent=2))
+
+
+async def recent_candidate_raw(request):
+    from .db import RecentCandidate
+    from .recent import raw_candidate_path
+    with session() as db:
+        if not admin_session(request, db):
+            return RedirectResponse("/admin/login", status_code=303)
+        row = db.get(RecentCandidate, request.path_params["cid"])
+        if row is None or row.status != "oversized":
+            raise HTTPException(404)
+        try:
+            path = raw_candidate_path(row)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        return FileResponse(path, media_type="application/json", filename="source-" + row.id + ".json",
+                            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
 
 async def deliveries(request):
@@ -444,4 +464,5 @@ def routes():
             Route("/admin/reports/{bid}", report_detail),
             Route("/admin/sources", sources), Route("/admin/tasks", tasks), Route("/admin/deliveries", deliveries),
             Route("/admin/recent-candidates", recent_candidates), Route("/admin/recent-candidates/{cid}", recent_candidate_detail),
+            Route("/admin/recent-candidates/{cid}/raw", recent_candidate_raw),
             Route("/admin/actions/{kind}/{target}/{operation}", action, methods=["POST"])]

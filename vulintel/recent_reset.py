@@ -116,7 +116,7 @@ def step(db, value):
             targeted = source.kind in {"osv", "psf", "kev"}
             db.add(RecentSource(run_id=value["run_id"], source_id=source.id,
                                mode="targeted" if targeted else "published", start_at=start_at, end_at=cutoff,
-                               status="deferred" if targeted else "pending"))
+                               status="deferred" if targeted else "pending", next_run=now(), updated_at=now()))
         for row in db.scalars(select(MetadataState).where(MetadataState.key.like("source-progress:%"))):
             db.delete(row)
         db.add(Job(kind="bootstrap", source_id=value["run_id"]))

@@ -2,6 +2,8 @@
 
 ## 服务器状态
 
+v1.4.1无需数据库迁移。`bootstrap.oversized`和各来源oversized/oversized_candidates表示超过8MiB、原文完整保存但尚待核查的候选，不是已分析数或已核实新增。来源coverage_limited和coverage_note说明此类缺口；扫描可以完成，隔离项仍保留。管理页增加oversized筛选及管理员原文下载。旧报告冻结快照缺少新字段时按0兼容。
+
 v1.4.0 增加显式 `reset-recent --days 7 --clear-vulnerabilities --clear-reports`（服务器CLI，不增加MCP工具）。迁移005增加独立候选及来源扫描水位；重置范围、恢复和幂等说明见 [升级文档](UPGRADE_v1.4.0.md)。普通升级不自动切换或清库。
 
 近七天模式下 `health_check`、`get_source_status` 返回 `bootstrap`：固定window_start/end、phase、scan_complete、candidates、processed、verified_candidates、admitted_vulnerabilities、excluded_old、unverified、conflicts、pending、errors、status、updated_at、heartbeat_at、items_per_hour、percent、estimated_remaining_seconds和sources。来源发现总量未知时percent/ETA为null；队列ETA不包含未来新增、所有来源覆盖或延期重试。

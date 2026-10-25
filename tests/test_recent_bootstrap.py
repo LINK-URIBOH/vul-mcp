@@ -553,3 +553,153 @@ def test_source_failure_retains_cursor_without_report_maintenance_fence(store, c
         assert not active(db)
         state = progress(db)
         assert state["percent"] is None and state["estimated_remaining_seconds"] is None
+
+
+@pytest.mark.parametrize("initial", [True, False])
+def test_github_fractional_query_expands_to_seconds_keeps_precise_window(store, clock, initial):
+    from vulintel.recent import page
+    enable(store, "ghsa")
+    run_reset(emit=lambda _: None)
+    with store() as db:
+        state = db.scalar(select(RecentSource).where(RecentSource.source_id == "ghsa"))
+        state.start_at = state.start_at.replace(microsecond=138383)
+        state.end_at = state.end_at.replace(microsecond=138383)
+        state.initial = initial
+        original = (state.start_at, state.end_at)
+        db.commit()
+        source = db.get(Source, "ghsa")
+    calls = []
+    def respond(request):
+        value = request.url.params["published" if initial else "modified"]
+        assert value == "2026-10-18T02:00:00Z..2026-10-25T02:00:01Z"
+        calls.append(value)
+        return httpx.Response(200, json=[])
+    page(source, state, httpx.MockTransport(respond))
+    assert calls and (state.start_at, state.end_at) == original
+
+
+def test_github_saved_cursor_with_microseconds_is_normalized_without_losing_cursor(store, clock):
+    from vulintel.recent import page
+    enable(store, "ghsa")
+    run_reset(emit=lambda _: None)
+    with store() as db:
+        state = db.scalar(select(RecentSource).where(RecentSource.source_id == "ghsa"))
+        state.cursor = {"url": "https://api.github.com/advisories?published=2026-10-18T02%3A00%3A00.138383Z..2026-10-25T02%3A00%3A00.138383Z&after=opaque-cursor"}
+        db.commit()
+        source = db.get(Source, "ghsa")
+    def respond(request):
+        assert request.url.params["after"] == "opaque-cursor"
+        assert request.url.params["published"] == "2026-10-18T02:00:00Z..2026-10-25T02:00:00Z"
+        return httpx.Response(200, json=[])
+    page(source, state, httpx.MockTransport(respond))
+
+
+def test_cisa_2_4mb_record_keeps_complete_body_and_scan_can_continue(store, clock):
+    enable(store, "cisa-advisories")
+    run_reset(emit=lambda _: None)
+    body = "x" * 2_396_298
+    feed = ('<rss version="2.0"><channel><title>Security</title><item><title>' + CVE + '</title>'
+            '<link>https://www.cisa.gov/advisory/big</link><description>' + body + '</description>'
+            '<pubDate>Sat, 24 Oct 2026 00:00:00 GMT</pubDate></item><item><title>CVE-2026-12346</title>'
+            '<link>https://www.cisa.gov/advisory/next</link><description>next full item</description>'
+            '<pubDate>Sat, 24 Oct 2026 00:00:00 GMT</pubDate></item></channel></rss>')
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, text=feed))
+    assert discover_once(transport=transport)
+    assert discover_once(transport=transport)
+    with store() as db:
+        rows = list(db.scalars(select(RecentCandidate)))
+        assert len(rows) == 2
+        assert any(row.data.get("description") == body for row in rows)
+        assert all(row.status == "pending" for row in rows)
+        assert progress(db)["scan_complete"] and progress(db)["oversized"] == 0
+        assert db.scalar(select(func.count()).select_from(Vulnerability)) == 0
+
+
+def test_over_8mib_is_quarantined_intact_not_analysed_and_following_item_is_discovered(store, clock):
+    from vulintel.recent import MAX_CANDIDATE_BYTES, raw_candidate_path
+    enable(store, "nodejs")
+    run_reset(emit=lambda _: None)
+    body = "z" * (MAX_CANDIDATE_BYTES + 1)
+    feed = ('<rss version="2.0"><channel><title>Security</title><item><title>' + CVE + '</title>'
+            '<link>https://nodejs.org/advisory/big</link><description>' + body + '</description>'
+            '<pubDate>Sat, 24 Oct 2026 00:00:00 GMT</pubDate></item><item><title>CVE-2026-12346</title>'
+            '<link>https://nodejs.org/advisory/next</link><description>next</description>'
+            '<pubDate>Sat, 24 Oct 2026 00:00:00 GMT</pubDate></item></channel></rss>')
+    transport = httpx.MockTransport(lambda _: httpx.Response(200, text=feed))
+    assert discover_once(transport=transport)
+    assert discover_once(transport=transport)
+    with store() as db:
+        quarantined = db.scalar(select(RecentCandidate).where(RecentCandidate.status == "oversized"))
+        assert quarantined and not quarantined.data["evidence_complete"] and quarantined.vulnerability_id is None
+        path = raw_candidate_path(quarantined)
+        assert json.loads(path.read_text(encoding="utf-8"))["description"] == body
+        assert progress(db)["scan_complete"] and progress(db)["oversized"] == 1
+        assert db.scalar(select(func.count()).select_from(RecentCandidate)) == 2
+        source = next(item for item in source_status(db) if item["id"] == "nodejs")
+        assert source["coverage_limited"] and source["oversized_candidates"] == 1 and not source["error"]
+        assert db.scalar(select(func.count()).select_from(Vulnerability)) == 0
+        path.write_bytes(b"corrupt")
+        with pytest.raises(ValueError, match="校验"):
+            raw_candidate_path(quarantined)
+
+
+def test_quarantine_disk_failure_keeps_page_checkpoint_and_does_not_drop_record(store, clock, monkeypatch):
+    from pathlib import Path
+    from vulintel.recent import MAX_CANDIDATE_BYTES
+    enable(store, "nodejs")
+    run_reset(emit=lambda _: None)
+    body = "z" * (MAX_CANDIDATE_BYTES + 1)
+    feed = ('<rss version="2.0"><channel><title>Security</title><item><title>' + CVE + '</title>'
+            '<link>https://nodejs.org/advisory/big</link><description>' + body + '</description>'
+            '<pubDate>Sat, 24 Oct 2026 00:00:00 GMT</pubDate></item></channel></rss>')
+    original = Path.write_bytes
+    def fail(path, data):
+        if path.parent.name == "quarantine":
+            raise OSError("disk unavailable")
+        return original(path, data)
+    monkeypatch.setattr(Path, "write_bytes", fail)
+    assert discover_once(transport=httpx.MockTransport(lambda _: httpx.Response(200, text=feed)))
+    with store() as db:
+        state = db.scalar(select(RecentSource).where(RecentSource.source_id == "nodejs"))
+        assert state.status == "failed" and not state.cursor.get("offset")
+        assert db.scalar(select(func.count()).select_from(RecentCandidate)) == 0
+
+
+def test_github_query_rounding_does_not_expand_actual_admission_window(store, clock):
+    enable(store, "ghsa")
+    run_reset(emit=lambda _: None)
+    with store() as db:
+        state = db.scalar(select(RecentSource).where(RecentSource.source_id == "ghsa"))
+        state.end_at = START.replace(microsecond=138383)
+        offer(db, state, {"source_key": "GHSA-aaaa-bbbb-cccc", "title": "too late", "aliases": [],
+                         "published": "2026-10-25T02:00:00.500000Z", "references": []})
+        db.commit()
+    clock[0] += timedelta(seconds=2)
+    verify_all(httpx.MockTransport(lambda _: pytest.fail("no evidence URL should be fetched")))
+    with store() as db:
+        row = db.scalar(select(RecentCandidate))
+        assert row.status == "excluded" and row.end_at.microsecond == 138383
+        assert db.scalar(select(func.count()).select_from(Vulnerability)) == 0
+
+
+def test_quarantine_download_requires_admin_and_serves_the_intact_original(store, clock, monkeypatch):
+    from starlette.testclient import TestClient
+    from vulintel.app import create_app
+    from vulintel.auth import token_hash
+    monkeypatch.setattr("vulintel.recent.MAX_CANDIDATE_BYTES", 1024)
+    enable(store, "nodejs")
+    run_reset(emit=lambda _: None)
+    original = {"source_key": "big", "title": "full evidence", "aliases": [], "references": [], "description": "x" * 2048}
+    stage_record(store, original, "nodejs")
+    with store() as db:
+        row = db.scalar(select(RecentCandidate))
+        cid = row.id
+        db.add(WebSession(id=token_hash("raw-cookie"),
+                          subject="admin", csrf="csrf", expires=database.now() + timedelta(days=1)))
+        db.commit()
+    with TestClient(create_app(), base_url="https://vul.valna.cn") as client:
+        assert client.get("/admin/recent-candidates/" + cid + "/raw", follow_redirects=False).status_code == 303
+        response = client.get("/admin/recent-candidates/" + cid + "/raw", headers={"Cookie": "vul_session=raw-cookie"})
+        assert response.status_code == 200 and response.json() == original
+        assert "attachment" in response.headers["content-disposition"]
+        assert response.headers["x-content-type-options"] == "nosniff"

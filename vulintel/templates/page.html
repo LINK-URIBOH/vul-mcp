@@ -10,7 +10,7 @@
 {% if stats %}<dl class="stats">{% for key,value in stats.items() %}<div><dt>{{ key }}</dt><dd>{{ value }}</dd></div>{% endfor %}</dl>{% endif %}
 {% if bootstrap %}<section class="summary"><h2>近七天分阶段初始化</h2>
 <p>固定窗口：{{ bootstrap.window_start }} 至 {{ bootstrap.window_end }}（UTC）；阶段：{{ {'cleanup':'清理','discovering':'候选发现','verifying':'日期核实','scan_complete':'初始化扫描完成'}.get(bootstrap.phase,bootstrap.phase) }}。</p>
-<p>候选 {{ bootstrap.candidates }}；已核实候选 {{ bootstrap.verified_candidates }}；正式漏洞 {{ bootstrap.admitted_vulnerabilities }}；旧记录排除 {{ bootstrap.excluded_old }}；日期待核实 {{ bootstrap.unverified }}；冲突 {{ bootstrap.conflicts }}；待补证 {{ bootstrap.pending }}；补证错误 {{ bootstrap.errors }}。</p>
+<p>候选 {{ bootstrap.candidates }}；已核实候选 {{ bootstrap.verified_candidates }}；正式漏洞 {{ bootstrap.admitted_vulnerabilities }}；旧记录排除 {{ bootstrap.excluded_old }}；日期待核实 {{ bootstrap.unverified }}；冲突 {{ bootstrap.conflicts }}；待补证 {{ bootstrap.pending }}；补证错误 {{ bootstrap.errors }}；超大条目待核查 {{ bootstrap.oversized or 0 }}。</p>
 <p>扫描完成：{{ '是' if bootstrap.scan_complete else '否' }}，与日期是否全部核实分开统计。联网补证不阻塞报告。<a href="/admin/recent-candidates">查看候选证据和失败原因</a>。</p>
 <p>最近更新 {{ bootstrap.updated_at }}；心跳 {{ bootstrap.heartbeat_at or '当前未运行网络步骤' }}；速度 {{ bootstrap.items_per_hour or '尚不能估算' }} 条/小时；剩余 {{ bootstrap.estimated_remaining_seconds if bootstrap.estimated_remaining_seconds is not none else '总量或速度未知' }} 秒（估算）。</p>
 {% if bootstrap.percent is not none %}<p>当前已发现候选处理进度 {{ bootstrap.percent }}%，不代表全球来源覆盖率。</p>{% endif %}

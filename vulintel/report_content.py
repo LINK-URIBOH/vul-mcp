@@ -80,7 +80,7 @@ def header(batch, state):
     bootstrap = state.work.get("bootstrap")
     if bootstrap:
         result += (f'<p>分阶段采集：暂存候选待核实 {bootstrap["unverified"]} 条、日期冲突 {bootstrap["conflicts"]} 条、'
-                   f'待补证 {bootstrap["pending"]} 条；这些数量独立于正式漏洞库和本批合格候选。'
+                   f'待补证 {bootstrap["pending"]} 条、超大待核查 {bootstrap.get("oversized", 0)} 条；这些数量独立于正式漏洞库和本批合格候选。'
                    f'<a href="{ESC(settings().public_base_url)}/admin/recent-candidates">查看候选核实清单</a>。'
                    '定向来源覆盖有限，不代表全部来源已扫描。</p>')
     for key, label in [("risk_summary", "核心风险"), ("repair_priorities", "优先修复建议")]:
@@ -144,7 +144,8 @@ def coverage(batch, state):
     result = f'<section><h2 style="font-size:20px">采集覆盖</h2><p>状态快照：{ESC(label_time(state.coverage_at))}；不代表当前实时状态。</p>'
     result += '<div style="overflow-x:auto"><table style="border-collapse:collapse;width:100%;font-size:13px"><tr><th align="left">来源</th><th align="left">状态</th><th align="left">最近成功（北京时间）</th></tr>'
     for source in batch.coverage:
-        label = "停用" if not source["enabled"] else ("覆盖有限／定向补充" if source.get("coverage_limited") else
+        label = "停用" if not source["enabled"] else ("覆盖有限／超大条目待核查" if source.get("oversized_candidates") else
+                "覆盖有限／定向补充" if source.get("coverage_limited") else
                 "失败" if source["error"] else "过期" if source["stale"] else "正常")
         result += f'<tr><td style="padding:6px;border-bottom:1px solid #dbe2e9">{text(source["name"])}</td><td>{label}</td><td>{ESC(label_time(source.get("last_success_utc")))}</td></tr>'
     return result + '</table></div><p>失败或过期来源存在覆盖缺口，不等于没有新增漏洞。详细采集错误和任务诊断见管理页。</p></section>'
